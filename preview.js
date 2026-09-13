@@ -144,4 +144,226 @@ function renderCardsHtml(node) {
     </div>
   `).join('') : '<div class="empty-state" style="padding:30px 10px">该知识点下暂无卡片</div>';
 
-  return body + `<button class="bt
+  return body + `<button class="btn btn-ghost btn-block mt8" data-action="add-card">+ 添加空白卡片</button>`;
+}
+
+function bindPreviewEvents() {
+  const overlay = document.getElementById('importPreview');
+  if (!overlay) return;
+
+  const backBtn = overlay.querySelector('#previewBack');
+  if (backBtn) {
+    backBtn.onclick = () => {
+      if (confirm('放弃导入？已编辑的内容会丢失。')) {
+        importDraft = null;
+        overlay.classList.remove('show');
+      }
+    };
+  }
+
+  // ===== 修复：ID 改为 previewConfirm，绑定全局函数 =====
+  const confirmBtn = document.getElementById('previewConfirm');
+  if (confirmBtn) {
+    confirmBtn.onclick = window.doConfirmImport;
+  } else {
+    console.warn('previewConfirm 按钮未找到');
+  }
+
+  const sel = overlay.querySelector('#previewNodeSelect');
+  if (sel) sel.onchange = () => { importDraftNodeId = sel.value; renderImportPreview(); };
+
+  overlay.querySelectorAll('.draft-question').forEach(editor => {
+    const idx = Number(editor.dataset.idx);
+    editor.addEventListener('input', () => {
+      const node = findNodeById(importDraft, importDraftNodeId);
+      if (node && node.cards[idx]) node.cards[idx].question = editor.textContent;
+    });
+    editor.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+      document.execCommand('insertText', false, text);
+    });
+  });
+
+  overlay.querySelectorAll('[data-action]').forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const card = btn.closest('.draft-card');
+      const idx = card ? Number(card.dataset.idx) : -1;
+      handlePreviewAction(btn.dataset.action, idx);
+    };
+  });
+
+  overlay.querySelectorAll('.draft-answer-item').forEach(el => {
+    el.onclick = () => {
+      const card = el.closest('.draft-card');
+      undoBlank(Number(card.dataset.idx), Number(el.dataset.ai));
+    };
+  });
+}
+
+function handlePreviewAction(action, idx) {
+  if (action === 'blank') doBlank(idx);
+  else if (action === 'split') doSplit(idx);
+  else if (action === 'merge-up') doMergeUp(idx);
+  else if (action === 'delete') doDelete(idx);
+  else if (action === 'add-card') doAddCard();
+}
+
+function getCaretOffset(container, range) {
+  const pre = range.cloneRange();
+  pre.selectNodeContents(container);
+  pre.setEnd(range.endContainer, range.endOffset);
+  return pre.toString().length;
+}
+
+function refreshAnswerList(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const list = document.querySelector(`.draft-card[data-idx="${idx}"] .draft-answer-list`);
+  if (!list) return;
+  if (!card.answers.length) {
+    list.innerHTML = '<span class="text-sub">（选中题干文字后点"挖空"）</span>';
+    return;
+  }
+  list.innerHTML = card.answers.map((a, ai) =>
+    `<span class="draft-answer-item" data-ai="${ai}" title="点击取消挖空">${escapeHtml(a)}</span>`
+  ).join('');
+  list.querySelectorAll('.draft-answer-item').forEach(el => {
+    el.onclick = () => {
+      const cardEl = el.closest('.draft-card');
+      undoBlank(Number(cardEl.dataset.idx), Number(el.dataset.ai));
+    };
+  });
+}
+
+function doBlank(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const editor = document.querySelector(`.draft-question[data-idx="${idx}"]`);
+  if (!editor) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) { toast('请先选中要挖空的文字'); return; }
+  const range = sel.getRangeAt(0);
+  if (range.collapsed || !editor.contains(range.commonAncestorContainer)) {
+    toast('请先选中题干中要挖空的文字'); return;
+  }
+  const text = range.toString();
+  if (!text.trim()) { toast('选中的内容为空'); return; }
+  range.deleteContents();
+  range.insertNode(document.createTextNode('___'));
+  card.question = editor.textContent;
+  card.answers.push(text);
+  refreshAnswerList(idx);
+}
+
+function doSplit(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const editor = document.querySelector(`.draft-question[data-idx="${idx}"]`);
+  const sel = window.getSelection();
+  if (!sel.rangeCount) { toast('请把光标放在要分段的位置'); return; }
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.commonAncestorContainer)) { toast('请把光标放在题干内'); return; }
+  const fullText = editor.textContent;
+  const offset = getCaretOffset(editor, range);
+  const before = fullText.slice(0, offset).trim();
+  const after = fullText.slice(offset).trim();
+  if (!before || !after) { toast('请在题干中间分段'); return; }
+
+  const blanksBefore = (before.match(/___/g) || []).length;
+  const answersBefore = card.answers.slice(0, blanksBefore);
+  const answersAfter = card.answers.slice(blanksBefore);
+
+  card.question = before;
+  card.answers = answersBefore;
+  node.cards.splice(idx + 1, 0, { id: draftId('cd'), question: after, answers: answersAfter });
+  renderImportPreview();
+}
+
+function doMergeUp(idx) {
+  if (idx <= 0) return;
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  const prev = node.cards[idx - 1];
+  const cur = node.cards[idx];
+  prev.question = (prev.question + ' ' + cur.question).trim();
+  prev.answers = prev.answers.concat(cur.answers);
+  node.cards.splice(idx, 1);
+  renderImportPreview();
+}
+
+function doDelete(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  if (!confirm('删除这张卡片？')) return;
+  node.cards.splice(idx, 1);
+  renderImportPreview();
+}
+
+function doAddCard() {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  node.cards.push({ id: draftId('cd'), question: '', answers: [] });
+  renderImportPreview();
+  const editors = document.querySelectorAll('.draft-question');
+  const last = editors[editors.length - 1];
+  if (last) last.focus();
+}
+
+function undoBlank(idx, ai) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const answer = card.answers[ai];
+  if (answer === undefined) return;
+  let count = -1;
+  card.question = card.question.replace(/___/g, (m) => {
+    count++;
+    return count === ai ? answer : m;
+  });
+  card.answers.splice(ai, 1);
+  renderImportPreview();
+}
+
+// ===== 修复：挂到全局，确保按钮能调用 =====
+window.doConfirmImport = async function doConfirmImport() {
+  if (!importDraft) {
+    toast('没有可导入的内容（importDraft 为空）');
+    console.warn('importDraft 为空，无法导入');
+    return;
+  }
+  const nodes = flattenNodes(importDraft);
+  let totalCards = 0;
+  for (const n of nodes) {
+    if (n.cards) {
+      n.cards = n.cards.filter(c => c.question.trim() && c.answers.length);
+      totalCards += n.cards.length;
+    }
+  }
+  if (!totalCards) {
+    toast('没有有效卡片（需要有题干和答案）');
+    return;
+  }
+  document.getElementById('importPreview').classList.remove('show');
+  try {
+    showImportProgress('write', { total: totalCards });
+    const result = await importTreeBatch(importDraft.children, (done, total) => {
+      updateImportProgress({ done, total });
+    });
+    showImportProgress('done', { nodeCount: result.nodeCount, cardCount: totalCards });
+    importDraft = null;
+    currentTab = 'home';
+    navStack.length = 0;
+    await new Promise(r => setTimeout(r, 500));
+    hideImportProgress();
+    render();
+  } catch (e) {
+    hideImportProgress();
+    toast('导入失败：' + e.message);
+    console.error(e);
+  }
+};
