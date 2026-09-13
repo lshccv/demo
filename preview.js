@@ -1,5 +1,5 @@
 /* ============================================================
- * 导入预览编辑界面
+ * 导入预览编辑界面 - 修复版
  * 挖空即答案 / 手动分段 / 合并 / 删除 / 添加
  * ============================================================ */
 
@@ -161,12 +161,15 @@ function bindPreviewEvents() {
     };
   }
 
-  // ===== 修复：ID 改为 previewConfirm，绑定全局函数 =====
+  // ===== 核心修复：绑定 previewConfirm 按钮 =====
   const confirmBtn = document.getElementById('previewConfirm');
   if (confirmBtn) {
-    confirmBtn.onclick = window.doConfirmImport;
+    confirmBtn.onclick = () => {
+      console.log('[preview.js] 确认导入按钮被点击');
+      window.doConfirmImport();
+    };
   } else {
-    console.warn('previewConfirm 按钮未找到');
+    console.warn('[preview.js] previewConfirm 按钮未找到');
   }
 
   const sel = overlay.querySelector('#previewNodeSelect');
@@ -329,13 +332,16 @@ function undoBlank(idx, ai) {
   renderImportPreview();
 }
 
-// ===== 修复：挂到全局，确保按钮能调用 =====
+// ===== 核心修复：挂到全局 + 完整导入逻辑 =====
 window.doConfirmImport = async function doConfirmImport() {
+  console.log('[doConfirmImport] 开始执行');
+
   if (!importDraft) {
-    toast('没有可导入的内容（importDraft 为空）');
-    console.warn('importDraft 为空，无法导入');
+    toast('没有可导入的内容（草稿为空）。请重新导入 Word 文件。');
+    console.warn('[doConfirmImport] importDraft 为 null');
     return;
   }
+
   const nodes = flattenNodes(importDraft);
   let totalCards = 0;
   for (const n of nodes) {
@@ -344,17 +350,24 @@ window.doConfirmImport = async function doConfirmImport() {
       totalCards += n.cards.length;
     }
   }
+
   if (!totalCards) {
-    toast('没有有效卡片（需要有题干和答案）');
+    toast('没有有效卡片（每张卡片需要题干和至少一个答案）');
     return;
   }
+
+  console.log(`[doConfirmImport] 有效卡片 ${totalCards} 张，开始写入`);
+
   document.getElementById('importPreview').classList.remove('show');
+
   try {
     showImportProgress('write', { total: totalCards });
     const result = await importTreeBatch(importDraft.children, (done, total) => {
       updateImportProgress({ done, total });
     });
     showImportProgress('done', { nodeCount: result.nodeCount, cardCount: totalCards });
+    console.log(`[doConfirmImport] 写入完成: ${result.nodeCount} 节点, ${totalCards} 卡片`);
+
     importDraft = null;
     currentTab = 'home';
     navStack.length = 0;
@@ -364,6 +377,18 @@ window.doConfirmImport = async function doConfirmImport() {
   } catch (e) {
     hideImportProgress();
     toast('导入失败：' + e.message);
-    console.error(e);
+    console.error('[doConfirmImport] 错误:', e);
   }
 };
+
+// ===== 兜底：页面加载后确保绑定 =====
+setTimeout(() => {
+  const btn = document.getElementById('previewConfirm');
+  if (btn && !btn.onclick) {
+    btn.onclick = () => {
+      console.log('[兜底] 确认导入点击');
+      window.doConfirmImport();
+    };
+    console.log('[兜底] 已强制绑定确认导入按钮');
+  }
+}, 800);
