@@ -1,824 +1,407 @@
 /* ============================================================
- *  闪卡学习 - 本地卡片记忆学习工具
- *  存储: IndexedDB  交互: SPA + 底部 Tab  答案: 翻转自判
+ * 导入预览编辑界面 - 修复版
+ * 修复：回车换行保留 / 分段合并不跳回顶部
  * ============================================================ */
 
-/* ---------- 1. IndexedDB ---------- */
-const DB_NAME = 'FlashCardDB';
-const DB_VERSION = 2;
-let db = null;
+let importDraft = null;
+let importDraftNodeId = null;
+let _draftSeq = 0;
+const draftId = (p) => p + '_' + (++_draftSeq);
+let _previewKeepIdx = 0;
 
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const d = e.target.result;
-      if (!d.objectStoreNames.contains('chapters')) {
-        const s = d.createObjectStore('chapters', { keyPath: 'id' });
-        s.createIndex('parentId', 'parentId');
-        s.createIndex('createdAt', 'createdAt');
-      } else {
-        const s = req.transaction.objectStore('chapters');
-        if (!s.indexNames.contains('parentId')) s.createIndex('parentId', 'parentId');
+function initDraft(tree) {
+  const root = { id: draftId('nd'), level: 0, name: 'root', children: tree, cards: [] };
+  const assign = (nodes) => {
+    for (const n of nodes) {
+      n.id = draftId('nd');
+      n.children = n.children || [];
+      n.cards = n.cards || [];
+      for (const c of n.cards) {
+        c.id = draftId('cd');
+        if (!Array.isArray(c.answers)) c.answers = [];
+        if (typeof c.question !== 'string') c.question = '';
       }
-      if (!d.objectStoreNames.contains('cards')) {
-        const s = d.createObjectStore('cards', { keyPath: 'id' });
-        s.createIndex('chapterId', 'chapterId');
-        s.createIndex('wrongCount', 'wrongCount');
-      }
-      if (!d.objectStoreNames.contains('settings')) {
-        d.createObjectStore('settings', { keyPath: 'key' });
+      assign(n.children);
+    }
+  };
+  assign(root.children);
+  return root;
+}
+
+function findNodeById(root, id) {
+  if (!root) return null;
+  if (root.id === id) return root;
+  for (const c of (root.children || [])) {
+    const r = findNodeById(c, id);
+    if (r) return r;
+  }
+  return null;
+}
+
+function getNodePath(root, id, path = []) {
+  if (!root) return null;
+  if (root.id === id) return [...path, root.name];
+  for (const c of (root.children || [])) {
+    const r = getNodePath(c, id, [...path, root.name]);
+    if (r) return r;
+  }
+  return null;
+}
+
+function flattenNodes(root, list = []) {
+  for (const c of (root.children || [])) { list.push(c); flattenNodes(c, list); }
+  return list;
+}
+
+function findFirstNodeWithCards(root) {
+  const walk = (nodes) => {
+    for (const n of nodes) {
+      if (n.cards && n.cards.length) return n;
+      const r = walk(n.children || []);
+      if (r) return r;
+    }
+    return null;
+  };
+  return walk(root.children);
+}
+
+function showImportPreview(tree, sourceName) {
+  if (!tree.length) { toast('没有可导入的内容'); return; }
+  importDraft = initDraft(tree);
+  const first = findFirstNodeWithCards(importDraft) || flattenNodes(importDraft)[0];
+  importDraftNodeId = first ? first.id : null;
+  _previewKeepIdx = 0;
+  renderImportPreview();
+  document.getElementById('importPreview').classList.add('show');
+}
+
+function ensurePreviewEl() {
+  let overlay = document.getElementById('importPreview');
+  if (overlay) return overlay;
+  overlay = document.createElement('div');
+  overlay.id = 'importPreview';
+  overlay.className = 'import-preview';
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+/* ===== 核心修复：contenteditable 回车换行保留 ===== */
+function editableToText(el) {
+  if (!el) return '';
+  const html = el.innerHTML;
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
+    .replace(/<p[^>]*>/gi, '')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<div[^>]*>/gi, '\n')
+    .replace(/<\/div>/gi, '')
+    .replace(/<li[^>]*>/gi, '\n- ')
+    .replace(/<\/li>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
+
+function renderImportPreview(keepIdx) {
+  if (typeof keepIdx === 'number') _previewKeepIdx = keepIdx;
+
+  const overlay = ensurePreviewEl();
+  const root = importDraft;
+  if (!root) return;
+  const nodes = flattenNodes(root);
+  const currentNode = findNodeById(root, importDraftNodeId);
+  const totalCards = nodes.reduce((s, n) => s + (n.cards ? n.cards.length : 0), 0);
+
+  overlay.innerHTML = `
+    <div class="preview-header">
+      <button class="preview-back" id="previewBack">‹ 返回</button>
+      <h2 class="preview-title">导入预览（${totalCards}）</h2>
+      <button class="preview-confirm" id="previewConfirm">确认导入</button>
+    </div>
+    <div class="preview-body">
+      <div class="preview-toolbar">
+        <label>知识点</label>
+        <select id="previewNodeSelect">
+          ${nodes.map(n => {
+            const p = getNodePath(root, n.id) || [n.name];
+            const label = p.slice(1).join(' › ') || n.name || '(未命名)';
+            const cnt = n.cards ? n.cards.length : 0;
+            return `<option value="${n.id}" ${n.id === importDraftNodeId ? 'selected' : ''}>${escapeHtml(label)}（${cnt}）</option>`;
+          }).join('')}
+        </select>
+      </div>
+      <div class="preview-cards" id="previewCards">
+        ${currentNode ? renderCardsHtml(currentNode) : '<div class="empty-state">没有可编辑的知识点</div>'}
+      </div>
+    </div>
+  `;
+  bindPreviewEvents();
+
+  // ★ 关键：渲染后自动滚动到正在编辑的卡片
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`.draft-card[data-idx="${_previewKeepIdx}"]`);
+    if (el) el.scrollIntoView({ block: 'nearest' });
+    const ed = document.querySelector(`.draft-question[data-idx="${_previewKeepIdx}"]`);
+    if (ed) ed.focus({ preventScroll: true });
+  });
+}
+
+function renderCardsHtml(node) {
+  const cards = node.cards || [];
+  const body = cards.length ? cards.map((c, i) => `
+    <div class="draft-card card" data-idx="${i}">
+      <div class="draft-card-header">
+        <span class="draft-card-no">#${i + 1}</span>
+        <div class="draft-card-actions">
+          ${i > 0 ? '<button class="draft-btn" data-action="merge-up">⬆ 合并到上一张</button>' : ''}
+          <button class="draft-btn" data-action="delete">🗑 删除</button>
+        </div>
+      </div>
+      <div class="draft-question" contenteditable="true" data-idx="${i}">${escapeHtml(c.question || '')}</div>
+      <div class="draft-toolbar">
+        <button class="draft-btn" data-action="blank">✂ 挖空选中</button>
+        <button class="draft-btn" data-action="split">↓ 在此分段</button>
+      </div>
+      <div class="draft-answer">
+        <span class="draft-answer-label">答案：</span>
+        <span class="draft-answer-list">${
+          (c.answers && c.answers.length)
+            ? c.answers.map((a, ai) => `<span class="draft-answer-item" data-ai="${ai}" title="点击取消挖空">${escapeHtml(a)}</span>`).join('')
+            : '<span class="text-sub">（选中题干文字后点"挖空"）</span>'
+        }</span>
+      </div>
+    </div>
+  `).join('') : '<div class="empty-state" style="padding:30px 10px">该知识点下暂无卡片</div>';
+
+  return body + `<button class="btn btn-ghost btn-block mt8" data-action="add-card">+ 添加空白卡片</button>`;
+}
+
+function bindPreviewEvents() {
+  const overlay = document.getElementById('importPreview');
+  if (!overlay) return;
+
+  const backBtn = overlay.querySelector('#previewBack');
+  if (backBtn) {
+    backBtn.onclick = () => {
+      if (confirm('放弃导入？已编辑的内容会丢失。')) {
+        importDraft = null;
+        overlay.classList.remove('show');
       }
     };
-    req.onsuccess = (e) => { db = e.target.result; resolve(db); };
-    req.onerror = (e) => reject(e.target.error);
-  });
-}
-function tx(store, mode = 'readonly') { return db.transaction(store, mode).objectStore(store); }
-function getAll(store) { return new Promise((res, rej) => { const r = tx(store).getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
-function get(store, id) { return new Promise((res, rej) => { const r = tx(store).get(id); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
-function put(store, val) { return new Promise((res, rej) => { const r = tx(store, 'readwrite').put(val); r.onsuccess = () => res(); r.onerror = () => rej(r.error); }); }
-function del(store, id) { return new Promise((res, rej) => { const r = tx(store, 'readwrite').delete(id); r.onsuccess = () => res(); r.onerror = () => rej(r.error); }); }
-function clearStore(store) { return new Promise((res, rej) => { const r = tx(store, 'readwrite').clear(); r.onsuccess = () => res(); r.onerror = () => rej(r.error); }); }
-
-/* ---------- 2. 设置 ---------- */
-const defaultSettings = {
-  cardsPerSession: 20,
-  sortMode: 'due_first',
-  darkMode: 'auto',
-  version: 2
-};
-async function getSetting(key) {
-  const s = await get('settings', key);
-  return s !== undefined ? s.value : defaultSettings[key];
-}
-async function setSetting(key, value) { await put('settings', { key, value }); }
-
-/* ---------- 3. 工具 ---------- */
-function uid(prefix = 'c') { return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6); }
-function toast(msg) {
-  const t = document.getElementById('toast');
-  if (!t) return;
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove('show'), 2000);
-}
-function escapeHtml(str) { return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s])); }
-function renderQuestion(text) { return escapeHtml(text).replace(/___/g, '<span class="blank">_____</span>'); }
-function applyTheme() {
-  const theme = localStorage.getItem('theme') || 'auto';
-  const dark = theme === 'dark' || (theme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
-}
-async function breadcrumb(nodeId) {
-  const parts = [];
-  let cur = await get('chapters', nodeId);
-  while (cur) { parts.unshift(cur.name); cur = cur.parentId ? await get('chapters', cur.parentId) : null; }
-  return parts;
-}
-
-/* ---------- 4. 进度条 ---------- */
-let _progTimer = null;
-function ensureProgressEl() {
-  let el = document.getElementById('importProgress');
-  if (el) return el;
-  el = document.createElement('div');
-  el.id = 'importProgress';
-  el.className = 'import-progress';
-  el.innerHTML = `
-    <div class="import-progress-card card">
-      <div class="import-progress-title" id="importProgressTitle">导入中…</div>
-      <div class="progress-bar"><div class="progress-fill" id="importProgressBar" style="width:0%"></div></div>
-      <div class="import-progress-text" id="importProgressText">准备…</div>
-    </div>`;
-  document.body.appendChild(el);
-  return el;
-}
-function showImportProgress(stage, opts = {}) {
-  const el = ensureProgressEl();
-  const title = document.getElementById('importProgressTitle');
-  const bar = document.getElementById('importProgressBar');
-  const text = document.getElementById('importProgressText');
-  el.classList.add('show');
-  clearTimeout(_progTimer);
-  if (stage === 'parse') {
-    title.textContent = '📖 解析中…'; bar.style.width = '8%'; text.textContent = '正在解析结构…';
-  } else if (stage === 'write') {
-    title.textContent = '✍️ 导入中…'; bar.style.width = '20%'; text.textContent = `0 / ${opts.total || '?'} 张卡片`;
-  } else if (stage === 'done') {
-    title.textContent = '✅ 完成'; bar.style.width = '100%';
-    text.textContent = `${opts.nodeCount || 0} 个目录节点，${opts.cardCount || 0} 张卡片已保存`;
   }
-}
-function updateImportProgress({ done, total }) {
-  const el = document.getElementById('importProgress');
-  if (!el || !el.classList.contains('show')) return;
-  const bar = document.getElementById('importProgressBar');
-  const text = document.getElementById('importProgressText');
-  const pct = total ? Math.round(done / total * 100) : 0;
-  if (bar) bar.style.width = (20 + pct * 0.8) + '%';
-  if (text) text.textContent = `${done} / ${total || '?'} 张卡片`;
-}
-function hideImportProgress() {
-  const el = document.getElementById('importProgress');
-  if (!el) return;
-  _progTimer = setTimeout(() => { el.classList.remove('show'); }, 300);
-}
 
-/* ---------- 5. 导入：解析后进入预览 ---------- */
-async function importText(text) {
-  showImportProgress('parse');
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  let parsed;
-  try {
-    parsed = parseImportText(text);
-  } catch (e) {
-    hideImportProgress(); toast('解析失败：' + e.message); return;
+  const confirmBtn = document.getElementById('previewConfirm');
+  if (confirmBtn) {
+    confirmBtn.onclick = () => { window.doConfirmImport(); };
   }
-  hideImportProgress();
-  const { tree, stat } = parsed;
-  if (!tree.length || stat.cards === 0) {
-    toast('未解析到有效内容（需含 "|答案"）'); return;
-  }
-  showImportPreview(tree, '文本导入');
-}
 
-// 批量导入（带 order 字段）
-async function importTreeBatch(treeNodes, onProgress) {
-  const chapters = [], cards = [];
-  let nodeCount = 0, cardCount = 0;
-  const walk = (nodes, parentId, orderOffset = 0) => {
-    nodes.forEach((node, i) => {
-      const id = uid('nd');
-      chapters.push({
-        id, name: node.name, level: node.level, parentId,
-        order: orderOffset + i,
-        createdAt: Date.now()
-      });
-      nodeCount++;
-      for (const c of (node.cards || [])) {
-        cards.push({
-          id: uid('cd'), chapterId: id, question: c.question, answers: c.answers,
-          hint: c.hint || '', correctStreak: 0, wrongCount: 0, lastReviewed: 0,
-          easeFactor: 2.5, flagged: false, tags: [], difficulty: 0
-        });
-        cardCount++;
+  const sel = overlay.querySelector('#previewNodeSelect');
+  if (sel) sel.onchange = () => { importDraftNodeId = sel.value; _previewKeepIdx = 0; renderImportPreview(); };
+
+  overlay.querySelectorAll('.draft-question').forEach(editor => {
+    const idx = Number(editor.dataset.idx);
+    editor.addEventListener('input', () => {
+      const node = findNodeById(importDraft, importDraftNodeId);
+      if (node && node.cards[idx]) {
+        node.cards[idx].question = editableToText(editor);
       }
-      walk(node.children || [], id, 0);
     });
-  };
-  walk(treeNodes, null);
-
-  await new Promise((resolve, reject) => {
-    const t = db.transaction(['chapters', 'cards'], 'readwrite');
-    const chStore = t.objectStore('chapters');
-    const cdStore = t.objectStore('cards');
-    for (const ch of chapters) chStore.put(ch);
-    let done = 0;
-    for (const cd of cards) {
-      const req = cdStore.put(cd);
-      req.onsuccess = () => {
-        done++;
-        if (onProgress && done % 10 === 0) onProgress(done, cards.length);
-      };
-    }
-    t.oncomplete = resolve;
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(new Error('写入被中止'));
+    editor.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+      document.execCommand('insertText', false, text);
+    });
   });
-  if (onProgress) onProgress(cards.length, cards.length);
-  return { nodeCount, cardCount };
+
+  overlay.querySelectorAll('[data-action]').forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const card = btn.closest('.draft-card');
+      const idx = card ? Number(card.dataset.idx) : -1;
+      handlePreviewAction(btn.dataset.action, idx);
+    };
+  });
+
+  overlay.querySelectorAll('.draft-answer-item').forEach(el => {
+    el.onclick = () => {
+      const card = el.closest('.draft-card');
+      undoBlank(Number(card.dataset.idx), Number(el.dataset.ai));
+    };
+  });
 }
 
-/* ---------- 6. 导出 / 导入备份 ---------- */
-async function exportJSON() {
-  const [chapters, cards, settings] = await Promise.all([
-    getAll('chapters'), getAll('cards'), getAll('settings')
-  ]);
-  const data = { version: 2, chapters, cards, settings, exportedAt: Date.now() };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = `flashcards-backup-${new Date().toISOString().slice(0, 10)}.json`;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-  toast('备份已导出');
+function handlePreviewAction(action, idx) {
+  if (action === 'blank') doBlank(idx);
+  else if (action === 'split') doSplit(idx);
+  else if (action === 'merge-up') doMergeUp(idx);
+  else if (action === 'delete') doDelete(idx);
+  else if (action === 'add-card') doAddCard();
 }
 
-async function importJSON(file) {
-  try {
-    showImportProgress('parse');
-    const text = await file.text();
-    const data = JSON.parse(text);
-    if (!data || !Array.isArray(data.cards) || !Array.isArray(data.chapters)) {
-      hideImportProgress(); toast('文件格式不正确'); return;
+function getCaretOffset(container, range) {
+  const pre = range.cloneRange();
+  pre.selectNodeContents(container);
+  pre.setEnd(range.endContainer, range.endOffset);
+  return pre.toString().length;
+}
+
+function refreshAnswerList(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const list = document.querySelector(`.draft-card[data-idx="${idx}"] .draft-answer-list`);
+  if (!list) return;
+  if (!card.answers.length) {
+    list.innerHTML = '<span class="text-sub">（选中题干文字后点"挖空"）</span>';
+    return;
+  }
+  list.innerHTML = card.answers.map((a, ai) =>
+    `<span class="draft-answer-item" data-ai="${ai}" title="点击取消挖空">${escapeHtml(a)}</span>`
+  ).join('');
+  list.querySelectorAll('.draft-answer-item').forEach(el => {
+    el.onclick = () => {
+      const cardEl = el.closest('.draft-card');
+      undoBlank(Number(cardEl.dataset.idx), Number(el.dataset.ai));
+    };
+  });
+}
+
+function doBlank(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const editor = document.querySelector(`.draft-question[data-idx="${idx}"]`);
+  if (!editor) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) { toast('请先选中要挖空的文字'); return; }
+  const range = sel.getRangeAt(0);
+  if (range.collapsed || !editor.contains(range.commonAncestorContainer)) {
+    toast('请先选中题干中要挖空的文字'); return;
+  }
+  const text = range.toString();
+  if (!text.trim()) { toast('选中的内容为空'); return; }
+  range.deleteContents();
+  range.insertNode(document.createTextNode('___'));
+  card.question = editableToText(editor);
+  card.answers.push(text);
+  refreshAnswerList(idx);
+}
+
+function doSplit(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const editor = document.querySelector(`.draft-question[data-idx="${idx}"]`);
+  const sel = window.getSelection();
+  if (!sel.rangeCount) { toast('请把光标放在要分段的位置'); return; }
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.commonAncestorContainer)) { toast('请把光标放在题干内'); return; }
+  const fullText = editor.textContent;
+  const offset = getCaretOffset(editor, range);
+  const before = fullText.slice(0, offset).trim();
+  const after = fullText.slice(offset).trim();
+  if (!before || !after) { toast('请在题干中间分段'); return; }
+
+  const blanksBefore = (before.match(/___/g) || []).length;
+  const answersBefore = card.answers.slice(0, blanksBefore);
+  const answersAfter = card.answers.slice(blanksBefore);
+
+  card.question = before;
+  card.answers = answersBefore;
+  node.cards.splice(idx + 1, 0, { id: draftId('cd'), question: after, answers: answersAfter });
+  renderImportPreview(idx + 1);
+}
+
+function doMergeUp(idx) {
+  if (idx <= 0) return;
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  const prev = node.cards[idx - 1];
+  const cur = node.cards[idx];
+  prev.question = (prev.question + ' ' + cur.question).trim();
+  prev.answers = prev.answers.concat(cur.answers);
+  node.cards.splice(idx, 1);
+  renderImportPreview(idx - 1 < 0 ? 0 : idx - 1);
+}
+
+function doDelete(idx) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  if (!confirm('删除这张卡片？')) return;
+  node.cards.splice(idx, 1);
+  renderImportPreview(idx);
+}
+
+function doAddCard() {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node) return;
+  node.cards.push({ id: draftId('cd'), question: '', answers: [] });
+  renderImportPreview(node.cards.length - 1);
+}
+
+function undoBlank(idx, ai) {
+  const node = findNodeById(importDraft, importDraftNodeId);
+  if (!node || !node.cards[idx]) return;
+  const card = node.cards[idx];
+  const answer = card.answers[ai];
+  if (answer === undefined) return;
+  let count = -1;
+  card.question = card.question.replace(/___/g, (m) => {
+    count++;
+    return count === ai ? answer : m;
+  });
+  card.answers.splice(ai, 1);
+  renderImportPreview(idx);
+}
+
+window.doConfirmImport = async function doConfirmImport() {
+  if (!importDraft) {
+    toast('没有可导入的内容（草稿为空）。请重新导入 Word 文件。');
+    return;
+  }
+
+  const nodes = flattenNodes(importDraft);
+  let totalCards = 0;
+  for (const n of nodes) {
+    if (n.cards) {
+      n.cards = n.cards.filter(c => c.question.trim() && c.answers.length);
+      totalCards += n.cards.length;
     }
-    if (!Array.isArray(data.settings)) data.settings = [];
-    const bad = data.cards.find(c => !c || !c.id || typeof c.question !== 'string' || !Array.isArray(c.answers));
-    if (bad) { hideImportProgress(); toast('卡片数据格式有误'); return; }
+  }
 
-    await clearStore('cards'); await clearStore('chapters'); await clearStore('settings');
-    showImportProgress('write', { total: data.cards.length });
-    let done = 0;
-    for (const c of data.chapters) await put('chapters', c);
-    for (const c of data.cards) { await put('cards', c); done++; if (done % 20 === 0) updateImportProgress({ done, total: data.cards.length }); }
-    for (const s of data.settings) await put('settings', s);
-    const dm = data.settings.find(s => s.key === 'darkMode');
-    if (dm) localStorage.setItem('theme', dm.value);
-    showImportProgress('done', { nodeCount: data.chapters.length, cardCount: data.cards.length });
-    toast('备份恢复成功');
-    currentTab = 'home'; navStack.length = 0;
+  if (!totalCards) {
+    toast('没有有效卡片（每张卡片需要题干和至少一个答案）');
+    return;
+  }
+
+  document.getElementById('importPreview').classList.remove('show');
+
+  try {
+    showImportProgress('write', { total: totalCards });
+    const result = await importTreeBatch(importDraft.children, (done, total) => {
+      updateImportProgress({ done, total });
+    });
+    showImportProgress('done', { nodeCount: result.nodeCount, cardCount: totalCards });
+
+    importDraft = null;
+    currentTab = 'home';
+    navStack.length = 0;
     await new Promise(r => setTimeout(r, 500));
     hideImportProgress();
     render();
-  } catch (e) { console.error(e); hideImportProgress(); toast('导入失败：' + e.message); }
-}
-
-/* ---------- 7. 记忆排序 ---------- */
-async function getDueCards(scopeNodeId) {
-  const allCards = await getAll('cards');
-  let chapterIds = null;
-  if (scopeNodeId) chapterIds = await getDescendantIds(scopeNodeId);
-  let cards = scopeNodeId ? allCards.filter(c => chapterIds.includes(c.chapterId)) : allCards;
-  const mode = await getSetting('sortMode');
-
-  if (mode === 'wrong_first') {
-    cards.sort((a, b) => (b.wrongCount - a.wrongCount) || (a.correctStreak - b.correctStreak) || (a.lastReviewed - b.lastReviewed));
-  } else if (mode === 'random') {
-    cards.sort(() => Math.random() - 0.5);
-  } else {
-    cards.sort((a, b) => {
-      const aw = a.wrongCount > 0 ? 0 : 1;
-      const bw = b.wrongCount > 0 ? 0 : 1;
-      if (aw !== bw) return aw - bw;
-      const an = a.lastReviewed === 0 ? 0 : 1;
-      const bn = b.lastReviewed === 0 ? 0 : 1;
-      if (an !== bn) return an - bn;
-      return a.lastReviewed - b.lastReviewed;
-    });
-  }
-  const limit = await getSetting('cardsPerSession');
-  return cards.slice(0, limit);
-}
-async function getDescendantIds(nodeId) {
-  const result = [nodeId];
-  const all = await getAll('chapters');
-  const children = all.filter(c => c.parentId === nodeId);
-  for (const child of children) result.push(...await getDescendantIds(child.id));
-  return result;
-}
-
-/* ---------- 8. 路由 ---------- */
-const app = document.getElementById('app');
-const headerTitle = document.getElementById('header-title');
-let currentTab = 'home';
-let navStack = [];
-
-const routes = {
-  home: renderHome,
-  study: renderStudy,
-  wrong: renderWrong,
-  settings: renderSettings
-};
-
-async function render() {
-  applyTheme();
-  app.innerHTML = '';
-  const page = document.createElement('div');
-  page.className = 'page';
-  app.appendChild(page);
-  const fn = routes[currentTab];
-  if (fn) await fn(page);
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === currentTab));
-  const backBtn = document.getElementById('header-back');
-  const canBack = (currentTab === 'home' && navStack.length > 0) || (currentTab === 'study' && studyState);
-  backBtn.style.display = canBack ? 'block' : 'none';
-}
-
-/* ---------- 9. 首页 ---------- */
-async function renderHome(page) {
-  headerTitle.textContent = '闪卡学习';
-
-  const allChapters = await getAll('chapters');
-  const allCards = await getAll('cards');
-
-  const currentParentId = navStack.length ? navStack[navStack.length - 1].id : null;
-  const children = allChapters
-    .filter(c => c.parentId === currentParentId)
-    .sort((a, b) => {
-      if (a.order != null && b.order != null) return a.order - b.order;
-      return a.createdAt - b.createdAt;
-    });
-
-  const flagged = allCards.filter(c => c.flagged).length;
-  const wrong = allCards.filter(c => c.wrongCount > 0).length;
-
-  if (!currentParentId) {
-    page.innerHTML = `
-      <div class="card text-center">
-        <div style="font-size:32px;font-weight:800;color:var(--primary)">${allCards.length}</div>
-        <div class="text-sub">总卡片数 · ${countLeafNodes(allChapters)} 个知识点</div>
-      </div>
-      <div class="card" style="display:flex;gap:16px;text-align:center">
-        <div style="flex:1"><div style="font-size:20px;font-weight:700;color:var(--danger)">${wrong}</div><div class="text-sub">待复习错题</div></div>
-        <div style="flex:1"><div style="font-size:20px;font-weight:700;color:var(--warning)">${flagged}</div><div class="text-sub">已标记</div></div>
-      </div>
-      ${wrong > 0 ? `<button class="btn btn-primary btn-block mt8" id="quickWrong">🎯 直接刷错题</button>` : ''}
-    `;
-    if (wrong > 0) {
-      page.querySelector('#quickWrong').onclick = () => {
-        const cards = allCards.filter(c => c.wrongCount > 0);
-        startStudyWithCards(cards, '错题练习');
-      };
-    }
-  }
-
-  if (navStack.length) {
-    const crumbs = navStack.map((n, i) =>
-      `<span class="crumb ${i === navStack.length - 1 ? 'current' : ''}" data-i="${i}">${escapeHtml(n.name)}</span>`
-    ).join('<span class="crumb-sep">›</span>');
-    page.insertAdjacentHTML('beforeend', `
-      <div class="breadcrumb">
-        <span class="crumb back-all" id="backAll">🏠</span>
-        <span class="crumb-sep">›</span>
-        ${crumbs}
-      </div>`);
-    page.querySelector('#backAll').onclick = () => { navStack.length = 0; render(); };
-    page.querySelectorAll('.crumb[data-i]').forEach(el => {
-      el.onclick = () => {
-        const i = Number(el.dataset.i);
-        if (i < navStack.length - 1) { navStack.length = i + 1; render(); }
-      };
-    });
-  } else {
-    page.insertAdjacentHTML('beforeend', `<h2 style="font-size:15px;margin:16px 0 8px;color:var(--text-sub)">📚 目录结构</h2>`);
-  }
-
-  if (!children.length) {
-    if (!currentParentId) {
-      page.insertAdjacentHTML('beforeend', `
-        <div class="empty-state">
-          <div class="empty-icon">📚</div>
-          <div>还没有内容，去「设置」导入讲义吧</div>
-        </div>`);
-    }
-    return;
-  }
-
-  for (const node of children) {
-    const hasChildren = allChapters.some(c => c.parentId === node.id);
-    const directCards = allCards.filter(c => c.chapterId === node.id);
-    const subCount = countSubCards(node.id, allChapters, allCards);
-    const reviewed = countReviewed(node.id, allChapters, allCards);
-    const pct = subCount ? Math.round(reviewed / subCount * 100) : 0;
-    const icon = node.level === 1 ? '📖' : node.level === 2 ? '📄' : '🔹';
-
-    const div = document.createElement('div');
-    div.className = 'card chapter-item';
-    div.draggable = true;
-    div.dataset.id = node.id;
-    div.innerHTML = `
-      <div class="chapter-info">
-        <div class="chapter-name">${icon} ${escapeHtml(node.name)}</div>
-        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-        <div class="chapter-meta">
-          <span>${subCount} 题</span>
-          <span>已学 ${reviewed}</span>
-          ${subCount ? `<span>正确率 ${calcAccuracy(node.id, allChapters, allCards)}%</span>` : ''}
-        </div>
-      </div>
-      <div class="chapter-right">
-        ${directCards.length > 0 && hasChildren ? `<button class="mini-study-btn" data-study="1">▶ ${directCards.length}</button>` : ''}
-        <span class="chapter-arrow">${hasChildren ? '›' : '▶'}</span>
-      </div>
-    `;
-
-    // 拖拽排序
-    div.addEventListener('dragstart', e => {
-      e.dataTransfer.setData('text/plain', node.id);
-      div.classList.add('dragging');
-    });
-    div.addEventListener('dragover', e => e.preventDefault());
-    div.addEventListener('drop', async e => {
-      e.preventDefault();
-      const fromId = e.dataTransfer.getData('text/plain');
-      if (fromId === node.id) return;
-      await reorderChapters(currentParentId, fromId, node.id);
-      render();
-    });
-    div.addEventListener('dragend', () => div.classList.remove('dragging'));
-
-    const studyBtn = div.querySelector('[data-study]');
-    if (studyBtn) {
-      studyBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        startStudyWithCards(directCards, node.name);
-      });
-    }
-    div.onclick = () => {
-      if (hasChildren) {
-        navStack.push({ id: node.id, name: node.name, level: node.level });
-        render();
-      } else if (directCards.length > 0) {
-        startStudy(node.id);
-      } else {
-        toast('该节点下暂无卡片');
-      }
-    };
-    page.appendChild(div);
-  }
-}
-
-async function reorderChapters(parentId, fromId, toId) {
-  const all = await getAll('chapters');
-  const list = all
-    .filter(c => c.parentId === parentId)
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-
-  const from = list.find(c => c.id === fromId);
-  const to = list.find(c => c.id === toId);
-  if (!from || !to) return;
-
-  const without = list.filter(c => c.id !== fromId);
-  const toIdx = without.findIndex(c => c.id === toId);
-  without.splice(toIdx, 0, from);
-
-  without.forEach((c, i) => {
-    c.order = i;
-    put('chapters', c);
-  });
-}
-
-function countSubCards(nodeId, allChapters, allCards) {
-  const ids = getDescendantIdsSync(nodeId, allChapters);
-  return allCards.filter(c => ids.includes(c.chapterId)).length;
-}
-function countReviewed(nodeId, allChapters, allCards) {
-  const ids = getDescendantIdsSync(nodeId, allChapters);
-  return allCards.filter(c => ids.includes(c.chapterId) && c.lastReviewed > 0).length;
-}
-function calcAccuracy(nodeId, allChapters, allCards) {
-  const ids = getDescendantIdsSync(nodeId, allChapters);
-  const cards = allCards.filter(c => ids.includes(c.chapterId));
-  if (!cards.length) return 0;
-  const good = cards.reduce((s, c) => s + (c.correctStreak > 0 ? 1 : 0), 0);
-  return Math.round(good / cards.length * 100);
-}
-function getDescendantIdsSync(nodeId, allChapters) {
-  const result = [nodeId];
-  const children = allChapters.filter(c => c.parentId === nodeId);
-  for (const child of children) result.push(...getDescendantIdsSync(child.id, allChapters));
-  return result;
-}
-function countLeafNodes(allChapters) { return allChapters.filter(c => c.level === 3).length; }
-
-/* ---------- 10. 刷题 ---------- */
-let studyState = null;
-async function startStudy(nodeId) {
-  const cards = await getDueCards(nodeId);
-  if (!cards.length) { toast('该知识点暂无题目或已全部掌握'); return; }
-  const path = await breadcrumb(nodeId);
-  studyState = {
-    scopeNodeId: nodeId, path, queue: cards,
-    index: 0, correct: 0, wrong: 0, sessionWrong: []
-  };
-  currentTab = 'study';
-  render();
-}
-function startStudyWithCards(cards, title) {
-  if (!cards.length) { toast('没有可刷的卡片'); return; }
-  studyState = {
-    scopeNodeId: null, path: [title], queue: cards.slice(0, 200),
-    index: 0, correct: 0, wrong: 0, sessionWrong: []
-  };
-  currentTab = 'study';
-  render();
-}
-
-async function renderStudy(page) {
-  if (!studyState || !studyState.queue.length) {
-    const allCards = await getAll('cards');
-    if (allCards.length) {
-      startStudyWithCards(allCards, '全部卡片');
-      return;
-    }
-    headerTitle.textContent = '刷题';
-    page.innerHTML = `<div class="empty-state"><div class="empty-icon">🎯</div><div>请先导入讲义，再开始刷题</div></div>`;
-    return;
-  }
-  renderStudyPage();
-}
-
-function renderStudyPage() {
-  const { queue, index, correct, wrong, path } = studyState;
-  const card = queue[index];
-  if (!card) { renderStudyDone(); return; }
-  const progressPct = queue.length ? Math.round(index / queue.length * 100) : 0;
-  const pathStr = (path && path.length) ? path.join(' › ') : '';
-  headerTitle.textContent = pathStr.length > 12 ? '…' + pathStr.slice(-12) : (pathStr || '刷题');
-
-  app.innerHTML = `
-    <div class="page study-container">
-      <div class="study-breadcrumb">${escapeHtml(pathStr)}</div>
-      <div class="study-progress">
-        <div class="study-progress-bar"><div class="study-progress-fill" style="width:${progressPct}%"></div></div>
-        <div class="study-progress-text">${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}</div>
-      </div>
-      <div class="flashcard" id="flashcard">
-        <div class="flashcard-inner">
-          <div class="flashcard-face flashcard-front">
-            <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
-            <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
-          </div>
-          <div class="flashcard-face flashcard-back">
-            <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
-            ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
-            <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
-            <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
-          </div>
-        </div>
-      </div>
-      <div class="judge-btns">
-        <button class="judge-btn judge-prev" id="btnPrev">← 上一张</button>
-        <button class="judge-btn judge-wrong" id="btnWrong">❌ 记错了</button>
-        <button class="judge-btn judge-right" id="btnRight">✅ 记住了</button>
-      </div>
-    </div>
-  `;
-  bindStudyEvents();
-}
-
-function bindStudyEvents() {
-  const fc = document.getElementById('flashcard');
-  fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
-  document.getElementById('btnRight').onclick = () => judgeCard(true);
-  document.getElementById('btnWrong').onclick = () => judgeCard(false);
-  document.getElementById('btnPrev').onclick = goPrevCard;
-
-  const flagBtn = document.getElementById('flagBtn');
-  if (flagBtn) flagBtn.onclick = async (e) => {
-    e.stopPropagation();
-    const card = studyState.queue[studyState.index];
-    card.flagged = !card.flagged;
-    await put('cards', card);
-    flagBtn.textContent = card.flagged ? '⭐' : '☆';
-    toast(card.flagged ? '已标记' : '已取消标记');
-  };
-
-  // 左右滑动手势
-  let sx = 0;
-  fc.addEventListener('touchstart', e => {
-    sx = e.touches[0].clientX;
-  }, { passive: true });
-  fc.addEventListener('touchend', e => {
-    const dx = e.changedTouches[0].clientX - sx;
-    if (Math.abs(dx) < 60) return;
-    if (dx > 0) goPrevCard();
-    else goNextCard();
-  });
-}
-
-function goNextCard() {
-  if (studyState && studyState.index < studyState.queue.length - 1) {
-    studyState.index++;
-    renderStudyPage();
-  } else {
-    toast('已经是最后一张');
-  }
-}
-
-function goPrevCard() {
-  if (studyState && studyState.index > 0) {
-    studyState.index--;
-    renderStudyPage();
-  } else {
-    toast('已经是第一张');
-  }
-}
-
-async function judgeCard(remembered) {
-  const card = studyState.queue[studyState.index];
-  card.lastReviewed = Date.now();
-  if (remembered) {
-    card.correctStreak += 1;
-    studyState.correct++;
-  } else {
-    card.wrongCount += 1;
-    card.correctStreak = 0;
-    studyState.wrong++;
-    studyState.sessionWrong.push(card.id);
-  }
-  await put('cards', card);
-  studyState.index++;
-  renderStudyPage();
-}
-
-async function renderStudyDone() {
-  const { correct, wrong, scopeNodeId } = studyState;
-  const total = correct + wrong;
-  const pct = total ? Math.round(correct / total * 100) : 0;
-  headerTitle.textContent = '完成';
-  app.innerHTML = `
-    <div class="page text-center" style="padding-top:40px">
-      <div style="font-size:56px">🎉</div>
-      <h2 style="margin:16px 0">本轮完成</h2>
-      <div class="card">
-        <div style="font-size:40px;font-weight:800;color:var(--primary)">${pct}%</div>
-        <div class="text-sub">正确率</div>
-        <div style="display:flex;justify-content:center;gap:24px;margin-top:12px">
-          <span>✅ ${correct}</span><span>❌ ${wrong}</span><span>共 ${total}</span>
-        </div>
-      </div>
-      <button class="btn btn-primary btn-block mt16" id="againBtn">再刷一轮</button>
-      <button class="btn btn-ghost btn-block mt8" id="homeBtn">返回目录</button>
-    </div>
-  `;
-  document.getElementById('againBtn').onclick = () => {
-    if (scopeNodeId) startStudy(scopeNodeId);
-    else { const cards = (studyState.queue || []).slice(); startStudyWithCards(cards, studyState.path?.[0] || '练习'); }
-  };
-  document.getElementById('homeBtn').onclick = () => { currentTab = 'home'; studyState = null; render(); };
-}
-
-/* ---------- 11. 错题本 ---------- */
-async function renderWrong(page) {
-  headerTitle.textContent = '错题本';
-  const allCards = await getAll('cards');
-  const wrong = allCards.filter(c => c.wrongCount > 0);
-  const allChapters = await getAll('chapters');
-  const topNodes = allChapters.filter(c => c.level === 1).sort((a, b) => a.createdAt - b.createdAt);
-
-  page.innerHTML = `<div class="text-sub" style="margin-bottom:8px">共 ${wrong.length} 道错题（按错误次数排序）</div>`;
-  if (!wrong.length) { page.innerHTML += `<div class="empty-state"><div class="empty-icon">✨</div><div>太棒了，没有错题！</div></div>`; return; }
-
-  const renderGroup = (title, cards, container) => {
-    if (!cards.length) return;
-    container.insertAdjacentHTML('beforeend', `<h3 class="wrong-group-title">${escapeHtml(title)} <span class="wrong-count">${cards.length}</span></h3>`);
-    cards.sort((a, b) => b.wrongCount - a.wrongCount);
-    for (const c of cards.slice(0, 10)) {
-      const div = document.createElement('div');
-      div.className = 'card wrong-card';
-      div.innerHTML = `
-        <div class="text-sub" style="margin-bottom:6px">错 ${c.wrongCount} 次</div>
-        <div style="font-size:15px;margin-bottom:8px">${renderQuestion(c.question)}</div>
-        <div class="flashcard-answer" style="font-size:15px">${c.answers.map(a=>escapeHtml(a)).join(' / ')}</div>
-      `;
-      container.appendChild(div);
-    }
-  };
-
-  if (topNodes.length) {
-    for (const top of topNodes) {
-      const ids = getDescendantIdsSync(top.id, allChapters);
-      renderGroup(top.name, wrong.filter(c => ids.includes(c.chapterId)), page);
-    }
-    const allTopIds = topNodes.flatMap(n => getDescendantIdsSync(n.id, allChapters));
-    renderGroup('其他', wrong.filter(c => !allTopIds.includes(c.chapterId)), page);
-  } else {
-    wrong.sort((a, b) => b.wrongCount - a.wrongCount);
-    for (const c of wrong) {
-      const div = document.createElement('div');
-      div.className = 'card wrong-card';
-      div.innerHTML = `<div class="text-sub" style="margin-bottom:6px">错 ${c.wrongCount} 次</div>
-        <div style="font-size:15px;margin-bottom:8px">${renderQuestion(c.question)}</div>
-        <div class="flashcard-answer" style="font-size:15px">${c.answers.map(a=>escapeHtml(a)).join(' / ')}</div>`;
-      page.appendChild(div);
-    }
-  }
-
-  const btn = document.createElement('button');
-  btn.className = 'btn btn-primary btn-block mt16';
-  btn.textContent = '只刷全部错题';
-  btn.onclick = () => startStudyWithCards(wrong, '错题练习');
-  page.appendChild(btn);
-}
-
-/* ---------- 12. 设置 ---------- */
-async function renderSettings(page) {
-  headerTitle.textContent = '设置';
-  const darkMode = await getSetting('darkMode');
-  const sortMode = await getSetting('sortMode');
-  const perSession = await getSetting('cardsPerSession');
-  page.innerHTML = `
-    <div class="card">
-      <h3 style="margin-bottom:12px">📥 导入讲义</h3>
-      <p class="text-sub" style="margin-bottom:8px">
-        支持 <b>Word (.docx)</b>、<b>.txt</b>、<b>.json</b> 备份。<br>
-        Word：按标题样式自动分篇/章/知识点，正文段落作为卡片草稿，进入预览后手动<b>挖空</b>和<b>分段</b>。<br>
-        文本：<code># 篇</code> <code>## 章</code> <code>### 知识点</code>，卡片用 <code>题干___。|答案</code>，多张用 <code>/</code> 分隔。
-      </p>
-      <textarea class="import-area" id="importText" placeholder="粘贴文本格式内容..."></textarea>
-      <button class="btn btn-primary btn-block mt8" id="importBtn">解析并预览</button>
-      <div class="text-center text-sub mt8">— 或 —</div>
-      <button class="btn btn-ghost btn-block" id="fileBtn">选择 .docx / .txt / .json 文件</button>
-      <input type="file" class="file-input" id="fileInput" accept=".txt,.json,.docx,text/plain,application/json,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
-    </div>
-
-    <div class="card">
-      <h3 style="margin-bottom:12px">📤 数据备份</h3>
-      <button class="btn btn-ghost btn-block" id="exportBtn">导出备份 (JSON)</button>
-    </div>
-
-    <div class="card">
-      <h3 style="margin-bottom:12px">⚙️ 学习设置</h3>
-      <div class="settings-row">
-        <label>每轮题目数</label>
-        <input type="number" id="setPerSession" value="${perSession}" min="5" max="200" style="width:80px">
-      </div>
-      <div class="settings-row">
-        <label>出题顺序</label>
-        <select id="setSort">
-          <option value="due_first" ${sortMode==='due_first'?'selected':''}>错题/未学优先</option>
-          <option value="wrong_first" ${sortMode==='wrong_first'?'selected':''}>错误次数优先</option>
-          <option value="random" ${sortMode==='random'?'selected':''}>随机</option>
-        </select>
-      </div>
-      <div class="settings-row">
-        <label>主题</label>
-        <select id="setDark">
-          <option value="auto" ${darkMode==='auto'?'selected':''}>跟随系统</option>
-          <option value="light" ${darkMode==='light'?'selected':''}>亮色</option>
-          <option value="dark" ${darkMode==='dark'?'selected':''}>暗色</option>
-        </select>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3 style="margin-bottom:12px">🗑️ 危险区</h3>
-      <button class="btn btn-danger btn-block" id="clearBtn">清空所有数据</button>
-    </div>
-  `;
-
-  document.getElementById('importBtn').onclick = async () => {
-    const text = document.getElementById('importText').value;
-    if (!text.trim()) { toast('请先粘贴内容'); return; }
-    await importText(text);
-  };
-  document.getElementById('fileBtn').onclick = () => document.getElementById('fileInput').click();
-  document.getElementById('fileInput').onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    e.target.value = '';
-    const name = file.name.toLowerCase();
-    try {
-      if (name.endsWith('.json')) { await importJSON(file); return; }
-      if (name.endsWith('.docx')) {
-        showImportProgress('parse');
-        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-        const { tree, stat } = await parseDocx(file);
-        hideImportProgress();
-        if (!tree.length || stat.cards === 0) { toast('未从 Word 中解析到内容'); return; }
-        showImportPreview(tree, file.name);
-        return;
-      }
-      const text = await file.text();
-      await importText(text);
-    } catch (err) {
-      hideImportProgress();
-      console.error(err);
-      toast('导入失败：' + err.message);
-    }
-  };
-  document.getElementById('exportBtn').onclick = exportJSON;
-  document.getElementById('setPerSession').onchange = async (e) => { await setSetting('cardsPerSession', Number(e.target.value)); toast('已保存'); };
-  document.getElementById('setSort').onchange = async (e) => { await setSetting('sortMode', e.target.value); toast('已保存'); };
-  document.getElementById('setDark').onchange = async (e) => { localStorage.setItem('theme', e.target.value); await setSetting('darkMode', e.target.value); applyTheme(); };
-  document.getElementById('clearBtn').onclick = async () => {
-    if (confirm('确定清空所有数据？此操作不可恢复！建议先导出备份。')) {
-      await clearStore('cards'); await clearStore('chapters'); await clearStore('settings');
-      toast('已清空'); navStack.length = 0; render();
-    }
-  };
-}
-
-/* ---------- 13. 启动 ---------- */
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.onclick = () => {
-    currentTab = tab.dataset.tab;
-    if (currentTab !== 'study') studyState = null;
-    render();
-  };
-});
-
-document.getElementById('header-back').onclick = () => {
-  if (currentTab === 'study') {
-    currentTab = 'home';
-    studyState = null;
-    render();
-  } else if (currentTab === 'home' && navStack.length > 0) {
-    navStack.pop();
-    render();
+  } catch (e) {
+    hideImportProgress();
+    toast('导入失败：' + e.message);
+    console.error('[doConfirmImport] 错误:', e);
   }
 };
 
-(async function init() {
-  await openDB();
-  for (const k of Object.keys(defaultSettings)) {
-    const existing = await get('settings', k);
-    if (existing === undefined) await put('settings', { key: k, value: defaultSettings[k] });
+setTimeout(() => {
+  const btn = document.getElementById('previewConfirm');
+  if (btn && !btn.onclick) {
+    btn.onclick = () => window.doConfirmImport();
   }
-  applyTheme();
-  render();
-  if ('serviceWorker' in navigator) {
-    try { await navigator.serviceWorker.register('sw.js'); } catch (e) { console.warn('SW 注册失败', e); }
-  }
-})();
+}, 800);
