@@ -142,14 +142,18 @@ async function importText(text) {
   showImportPreview(tree, '文本导入');
 }
 
-// 批量导入（替代原先逐条 await put）
+// 批量导入（带 order 字段）
 async function importTreeBatch(treeNodes, onProgress) {
   const chapters = [], cards = [];
   let nodeCount = 0, cardCount = 0;
-  const walk = (nodes, parentId) => {
-    for (const node of nodes) {
+  const walk = (nodes, parentId, orderOffset = 0) => {
+    nodes.forEach((node, i) => {
       const id = uid('nd');
-      chapters.push({ id, name: node.name, level: node.level, parentId, createdAt: Date.now() });
+      chapters.push({
+        id, name: node.name, level: node.level, parentId,
+        order: orderOffset + i,
+        createdAt: Date.now()
+      });
       nodeCount++;
       for (const c of (node.cards || [])) {
         cards.push({
@@ -159,8 +163,8 @@ async function importTreeBatch(treeNodes, onProgress) {
         });
         cardCount++;
       }
-      walk(node.children || [], id);
-    }
+      walk(node.children || [], id, 0);
+    });
   };
   walk(treeNodes, null);
 
@@ -242,7 +246,6 @@ async function getDueCards(scopeNodeId) {
   } else if (mode === 'random') {
     cards.sort(() => Math.random() - 0.5);
   } else {
-    // due_first：错题优先 > 未学优先 > 最久没复习优先
     cards.sort((a, b) => {
       const aw = a.wrongCount > 0 ? 0 : 1;
       const bw = b.wrongCount > 0 ? 0 : 1;
@@ -301,7 +304,10 @@ async function renderHome(page) {
   const currentParentId = navStack.length ? navStack[navStack.length - 1].id : null;
   const children = allChapters
     .filter(c => c.parentId === currentParentId)
-    .sort((a, b) => a.createdAt - b.createdAt);
+    .sort((a, b) => {
+      if (a.order != null && b.order != null) return a.order - b.order;
+      return a.createdAt - b.createdAt;
+    });
 
   const flagged = allCards.filter(c => c.flagged).length;
   const wrong = allCards.filter(c => c.wrongCount > 0).length;
@@ -368,6 +374,8 @@ async function renderHome(page) {
 
     const div = document.createElement('div');
     div.className = 'card chapter-item';
+    div.draggable = true;
+    div.dataset.id = node.id;
     div.innerHTML = `
       <div class="chapter-info">
         <div class="chapter-name">${icon} ${escapeHtml(node.name)}</div>
@@ -383,6 +391,22 @@ async function renderHome(page) {
         <span class="chapter-arrow">${hasChildren ? '›' : '▶'}</span>
       </div>
     `;
+
+    // 拖拽排序
+    div.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', node.id);
+      div.classList.add('dragging');
+    });
+    div.addEventListener('dragover', e => e.preventDefault());
+    div.addEventListener('drop', async e => {
+      e.preventDefault();
+      const fromId = e.dataTransfer.getData('text/plain');
+      if (fromId === node.id) return;
+      await reorderChapters(currentParentId, fromId, node.id);
+      render();
+    });
+    div.addEventListener('dragend', () => div.classList.remove('dragging'));
+
     const studyBtn = div.querySelector('[data-study]');
     if (studyBtn) {
       studyBtn.addEventListener('click', (e) => {
@@ -402,6 +426,26 @@ async function renderHome(page) {
     };
     page.appendChild(div);
   }
+}
+
+async function reorderChapters(parentId, fromId, toId) {
+  const all = await getAll('chapters');
+  const list = all
+    .filter(c => c.parentId === parentId)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+  const from = list.find(c => c.id === fromId);
+  const to = list.find(c => c.id === toId);
+  if (!from || !to) return;
+
+  const without = list.filter(c => c.id !== fromId);
+  const toIdx = without.findIndex(c => c.id === toId);
+  without.splice(toIdx, 0, from);
+
+  without.forEach((c, i) => {
+    c.order = i;
+    put('chapters', c);
+  });
 }
 
 function countSubCards(nodeId, allChapters, allCards) {
@@ -483,7 +527,7 @@ function renderStudyPage() {
         <div class="flashcard-inner">
           <div class="flashcard-face flashcard-front">
             <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
-            <span class="tap-hint">👆 点击查看答案</span>
+            <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
           </div>
           <div class="flashcard-face flashcard-back">
             <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
@@ -494,6 +538,7 @@ function renderStudyPage() {
         </div>
       </div>
       <div class="judge-btns">
+        <button class="judge-btn judge-prev" id="btnPrev">← 上一张</button>
         <button class="judge-btn judge-wrong" id="btnWrong">❌ 记错了</button>
         <button class="judge-btn judge-right" id="btnRight">✅ 记住了</button>
       </div>
@@ -507,6 +552,8 @@ function bindStudyEvents() {
   fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
   document.getElementById('btnRight').onclick = () => judgeCard(true);
   document.getElementById('btnWrong').onclick = () => judgeCard(false);
+  document.getElementById('btnPrev').onclick = goPrevCard;
+
   const flagBtn = document.getElementById('flagBtn');
   if (flagBtn) flagBtn.onclick = async (e) => {
     e.stopPropagation();
@@ -516,6 +563,36 @@ function bindStudyEvents() {
     flagBtn.textContent = card.flagged ? '⭐' : '☆';
     toast(card.flagged ? '已标记' : '已取消标记');
   };
+
+  // 左右滑动手势
+  let sx = 0;
+  fc.addEventListener('touchstart', e => {
+    sx = e.touches[0].clientX;
+  }, { passive: true });
+  fc.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - sx;
+    if (Math.abs(dx) < 60) return;
+    if (dx > 0) goPrevCard();
+    else goNextCard();
+  });
+}
+
+function goNextCard() {
+  if (studyState && studyState.index < studyState.queue.length - 1) {
+    studyState.index++;
+    renderStudyPage();
+  } else {
+    toast('已经是最后一张');
+  }
+}
+
+function goPrevCard() {
+  if (studyState && studyState.index > 0) {
+    studyState.index--;
+    renderStudyPage();
+  } else {
+    toast('已经是第一张');
+  }
 }
 
 async function judgeCard(remembered) {
