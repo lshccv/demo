@@ -146,12 +146,12 @@ async function importText(text) {
 async function importTreeBatch(treeNodes, onProgress) {
   const chapters = [], cards = [];
   let nodeCount = 0, cardCount = 0;
-  const walk = (nodes, parentId, orderOffset = 0) => {
+  const walk = (nodes, parentId) => {
     nodes.forEach((node, i) => {
       const id = uid('nd');
       chapters.push({
         id, name: node.name, level: node.level, parentId,
-        order: orderOffset + i,
+        order: i,
         createdAt: Date.now()
       });
       nodeCount++;
@@ -163,7 +163,7 @@ async function importTreeBatch(treeNodes, onProgress) {
         });
         cardCount++;
       }
-      walk(node.children || [], id, 0);
+      walk(node.children || [], id);
     });
   };
   walk(treeNodes, null);
@@ -246,6 +246,7 @@ async function getDueCards(scopeNodeId) {
   } else if (mode === 'random') {
     cards.sort(() => Math.random() - 0.5);
   } else {
+    // due_first：错题优先 > 未学优先 > 最久没复习优先
     cards.sort((a, b) => {
       const aw = a.wrongCount > 0 ? 0 : 1;
       const bw = b.wrongCount > 0 ? 0 : 1;
@@ -523,22 +524,25 @@ function renderStudyPage() {
         <div class="study-progress-bar"><div class="study-progress-fill" style="width:${progressPct}%"></div></div>
         <div class="study-progress-text">${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}</div>
       </div>
-      <div class="flashcard" id="flashcard">
-        <div class="flashcard-inner">
-          <div class="flashcard-face flashcard-front">
-            <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
-            <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
-          </div>
-          <div class="flashcard-face flashcard-back">
-            <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
-            ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
-            <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
-            <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
+      <div class="flashcard-track" id="flashcardTrack">
+        <div class="flashcard-slide" id="flashcardSlide">
+          <div class="flashcard" id="flashcard">
+            <div class="flashcard-inner">
+              <div class="flashcard-face flashcard-front">
+                <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
+                <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
+              </div>
+              <div class="flashcard-face flashcard-back">
+                <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
+                ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
+                <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
+                <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
       <div class="judge-btns">
-        <button class="judge-btn judge-prev" id="btnPrev">← 上一张</button>
         <button class="judge-btn judge-wrong" id="btnWrong">❌ 记错了</button>
         <button class="judge-btn judge-right" id="btnRight">✅ 记住了</button>
       </div>
@@ -549,11 +553,17 @@ function renderStudyPage() {
 
 function bindStudyEvents() {
   const fc = document.getElementById('flashcard');
+  const track = document.getElementById('flashcardTrack');
+  const slideEl = document.getElementById('flashcardSlide');
+
+  // 翻转
   fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
+
+  // 判分按钮（仅两个，无"上一张"）
   document.getElementById('btnRight').onclick = () => judgeCard(true);
   document.getElementById('btnWrong').onclick = () => judgeCard(false);
-  document.getElementById('btnPrev').onclick = goPrevCard;
 
+  // 标记
   const flagBtn = document.getElementById('flagBtn');
   if (flagBtn) flagBtn.onclick = async (e) => {
     e.stopPropagation();
@@ -564,16 +574,40 @@ function bindStudyEvents() {
     toast(card.flagged ? '已标记' : '已取消标记');
   };
 
-  // 左右滑动手势
-  let sx = 0;
-  fc.addEventListener('touchstart', e => {
-    sx = e.touches[0].clientX;
+  // ===== 左右滑动：仅卡片区域，带过渡动画 =====
+  let startX = 0, startY = 0, isSwiping = false;
+
+  track.addEventListener('touchstart', e => {
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+    isSwiping = false;
+    slideEl.style.transition = 'none';
   }, { passive: true });
-  fc.addEventListener('touchend', e => {
-    const dx = e.changedTouches[0].clientX - sx;
-    if (Math.abs(dx) < 60) return;
-    if (dx > 0) goPrevCard();
-    else goNextCard();
+
+  track.addEventListener('touchmove', e => {
+    const dx = e.touches[0].clientX - startX;
+    const dy = e.touches[0].clientY - startY;
+    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 10) {
+      isSwiping = true;
+      const clamped = Math.max(-80, Math.min(80, dx * 0.6));
+      slideEl.style.transform = `translateX(${clamped}px)`;
+    }
+  }, { passive: true });
+
+  track.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - startX;
+    slideEl.style.transition = 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)';
+
+    if (isSwiping && Math.abs(dx) > 60) {
+      const direction = dx > 0 ? -1 : 1; // 右滑=上一张, 左滑=下一张
+      slideEl.style.transform = `translateX(${direction * 110}%)`;
+      setTimeout(() => {
+        if (dx > 0) goPrevCard();
+        else goNextCard();
+      }, 280);
+    } else {
+      slideEl.style.transform = 'translateX(0)';
+    }
   });
 }
 
@@ -583,6 +617,7 @@ function goNextCard() {
     renderStudyPage();
   } else {
     toast('已经是最后一张');
+    resetSlide();
   }
 }
 
@@ -592,6 +627,15 @@ function goPrevCard() {
     renderStudyPage();
   } else {
     toast('已经是第一张');
+    resetSlide();
+  }
+}
+
+function resetSlide() {
+  const slideEl = document.getElementById('flashcardSlide');
+  if (slideEl) {
+    slideEl.style.transition = 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)';
+    slideEl.style.transform = 'translateX(0)';
   }
 }
 
