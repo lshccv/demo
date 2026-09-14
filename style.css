@@ -257,3 +257,13 @@ body {
   padding: 2px 8px; border-radius: 4px; font-size: 12px; cursor: pointer;
 }
 .draft-answer-item:hover { opacity: 0.85; }
+/* ===== 拖拽排序反馈 ===== */
+.chapter-item.dragging { opacity: 0.4; }
+.chapter-item { cursor: grab; }
+
+/* ===== 刷题：上一张按钮 ===== */
+.judge-prev {
+  background: #64748b;
+  flex: 0 0 88px;
+  font-size: 14px;
+}
