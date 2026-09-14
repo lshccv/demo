@@ -1,7 +1,7 @@
 /* ============================================================
  *  闪卡学习 - 本地卡片记忆学习工具
  *  存储: IndexedDB  交互: SPA + 底部 Tab  答案: 翻转自判
- *  修复：滑动方向/动画速度/页面抖动
+ *  修复：滑动方向/动画速度/页面抖动/只切卡片不重绘
  * ============================================================ */
 
 /* ---------- 1. IndexedDB ---------- */
@@ -347,8 +347,9 @@ function calcAccuracy(nodeId, allChapters, allCards) { const ids = getDescendant
 function getDescendantIdsSync(nodeId, allChapters) { const result = [nodeId]; const children = allChapters.filter(c => c.parentId === nodeId); for (const child of children) result.push(...getDescendantIdsSync(child.id, allChapters)); return result; }
 function countLeafNodes(allChapters) { return allChapters.filter(c => c.level === 3).length; }
 
-/* ---------- 10. 刷题 ---------- */
+/* ---------- 10. 刷题（修复版：滑动不抖 + 只切卡片） ---------- */
 let studyState = null;
+
 async function startStudy(nodeId) {
   const cards = await getDueCards(nodeId);
   if (!cards.length) { toast('该知识点暂无题目或已全部掌握'); return; }
@@ -356,6 +357,7 @@ async function startStudy(nodeId) {
   studyState = { scopeNodeId: nodeId, path, queue: cards, index: 0, correct: 0, wrong: 0, sessionWrong: [] };
   currentTab = 'study'; render();
 }
+
 function startStudyWithCards(cards, title) {
   if (!cards.length) { toast('没有可刷的卡片'); return; }
   studyState = { scopeNodeId: null, path: [title], queue: cards.slice(0, 200), index: 0, correct: 0, wrong: 0, sessionWrong: [] };
@@ -370,40 +372,24 @@ async function renderStudy(page) {
     page.innerHTML = `<div class="empty-state"><div class="empty-icon">🎯</div><div>请先导入讲义，再开始刷题</div></div>`;
     return;
   }
-  renderStudyPage();
-}
 
-function renderStudyPage() {
   const { queue, index, correct, wrong, path } = studyState;
   const card = queue[index];
-  if (!card) { renderStudyDone(); return; }
   const progressPct = queue.length ? Math.round(index / queue.length * 100) : 0;
   const pathStr = (path && path.length) ? path.join(' › ') : '';
   headerTitle.textContent = pathStr.length > 12 ? '…' + pathStr.slice(-12) : (pathStr || '刷题');
 
-  app.innerHTML = `
-    <div class="page study-container">
+  // ★ 首次渲染完整 DOM
+  page.innerHTML = `
+    <div class="study-container-fixed" id="studyContainer">
       <div class="study-breadcrumb">${escapeHtml(pathStr)}</div>
       <div class="study-progress">
-        <div class="study-progress-bar"><div class="study-progress-fill" style="width:${progressPct}%"></div></div>
-        <div class="study-progress-text">${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}</div>
+        <div class="study-progress-bar"><div class="study-progress-fill" id="progressFill" style="width:${progressPct}%"></div></div>
+        <div class="study-progress-text" id="progressText">${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}</div>
       </div>
       <div class="flashcard-track" id="flashcardTrack">
         <div class="flashcard-slide" id="flashcardSlide">
-          <div class="flashcard" id="flashcard">
-            <div class="flashcard-inner">
-              <div class="flashcard-face flashcard-front">
-                <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
-                <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
-              </div>
-              <div class="flashcard-face flashcard-back">
-                <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
-                ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
-                <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
-                <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
-              </div>
-            </div>
-          </div>
+          ${renderCardInner(card, pathStr)}
         </div>
       </div>
       <div class="judge-btns">
@@ -415,13 +401,51 @@ function renderStudyPage() {
   bindStudyEvents();
 }
 
+// ★ 只替换卡片内容，不重绘整个页面
+function updateCardContent(card) {
+  const slideEl = document.getElementById('flashcardSlide');
+  if (!slideEl) return;
+  const { path } = studyState;
+  const pathStr = (path && path.length) ? path.join(' › ') : '';
+  slideEl.innerHTML = renderCardInner(card, pathStr);
+}
+
+function renderCardInner(card, pathStr) {
+  return `
+    <div class="flashcard" id="flashcard">
+      <div class="flashcard-inner">
+        <div class="flashcard-face flashcard-front">
+          <div style="font-size:18px;line-height:1.8">${renderQuestion(card.question)}</div>
+          <span class="tap-hint">👆 点击查看答案 · 左右滑动切题</span>
+        </div>
+        <div class="flashcard-face flashcard-back">
+          <div class="flashcard-answer">${card.answers.map(a => escapeHtml(a)).join(' / ')}</div>
+          ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
+          <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
+          <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updateProgressUI() {
+  const { queue, index, correct, wrong } = studyState;
+  const fill = document.getElementById('progressFill');
+  const text = document.getElementById('progressText');
+  if (fill) fill.style.width = queue.length ? Math.round(index / queue.length * 100) + '%' : '0%';
+  if (text) text.textContent = `${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}`;
+}
+
 function bindStudyEvents() {
-  const fc = document.getElementById('flashcard');
   const track = document.getElementById('flashcardTrack');
   const slideEl = document.getElementById('flashcardSlide');
 
   // 翻转
-  fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
+  const fc = document.getElementById('flashcard');
+  if (fc) {
+    fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
+  }
 
   // 判分
   document.getElementById('btnRight').onclick = () => judgeCard(true);
@@ -438,7 +462,7 @@ function bindStudyEvents() {
     toast(card.flagged ? '已标记' : '已取消标记');
   };
 
-  // ===== 滑动手势（修正方向 + 慢动画 + 防页面滚动）=====
+  // ===== 滑动手势 =====
   let startX = 0, startY = 0, isSwiping = false, hasTriggered = false;
 
   track.addEventListener('touchstart', e => {
@@ -448,38 +472,40 @@ function bindStudyEvents() {
     hasTriggered = false;
     slideEl.style.transition = 'none';
     slideEl.style.transform = 'translateX(0)';
+    // ★ 锁死页面
+    document.body.style.overflow = 'hidden';
+    document.body.style.touchAction = 'none';
   }, { passive: false });
 
   track.addEventListener('touchmove', e => {
     const dx = e.touches[0].clientX - startX;
     const dy = e.touches[0].clientY - startY;
 
-    // 横向滑动超过纵向 → 锁定为滑动模式，阻止页面滚动
-    if (!isSwiping && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy)) {
+    if (!isSwiping && Math.abs(dx) > 6 && Math.abs(dx) > Math.abs(dy)) {
       isSwiping = true;
     }
 
     if (isSwiping) {
-      // 彻底阻止页面滚动
       e.preventDefault();
-      // 阻尼跟随，最大拉出 40% 宽度
-      const maxPull = window.innerWidth * 0.4;
-      const clamped = Math.max(-maxPull, Math.min(maxPull, dx * 0.7));
+      e.stopPropagation();
+      const maxPull = window.innerWidth * 0.35;
+      const clamped = Math.max(-maxPull, Math.min(maxPull, dx * 0.65));
       slideEl.style.transform = `translateX(${clamped}px)`;
     }
   }, { passive: false });
 
   track.addEventListener('touchend', e => {
+    // ★ 恢复页面
+    document.body.style.overflow = '';
+    document.body.style.touchAction = '';
+
     if (!isSwiping || hasTriggered) {
-      // 没触发滑动，回弹
       slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
       slideEl.style.transform = 'translateX(0)';
       return;
     }
 
     const dx = e.changedTouches[0].clientX - startX;
-
-    // 阈值 70px
     if (Math.abs(dx) < 70) {
       slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
       slideEl.style.transform = 'translateX(0)';
@@ -487,9 +513,6 @@ function bindStudyEvents() {
     }
 
     hasTriggered = true;
-
-    // ★ 方向修正：左滑(dx<0) = 下一张，右滑(dx>0) = 上一张
-    // 滑出方向跟手指同向
     const slideOutX = dx > 0 ? window.innerWidth : -window.innerWidth;
     slideEl.style.transition = 'transform 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
     slideEl.style.transform = `translateX(${slideOutX}px)`;
@@ -499,7 +522,16 @@ function bindStudyEvents() {
         // 右滑 → 上一张
         if (studyState.index > 0) {
           studyState.index--;
-          renderStudyPage();
+          updateCardContent(studyState.queue[studyState.index]);
+          updateProgressUI();
+          slideEl.style.transition = 'none';
+          slideEl.style.transform = `translateX(-${window.innerWidth}px)`;
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              slideEl.style.transition = 'transform 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+              slideEl.style.transform = 'translateX(0)';
+            });
+          });
         } else {
           toast('已经是第一张');
           slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
@@ -509,19 +541,47 @@ function bindStudyEvents() {
         // 左滑 → 下一张
         if (studyState.index < studyState.queue.length - 1) {
           studyState.index++;
-          renderStudyPage();
+          updateCardContent(studyState.queue[studyState.index]);
+          updateProgressUI();
+          slideEl.style.transition = 'none';
+          slideEl.style.transform = `translateX(${window.innerWidth}px)`;
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              slideEl.style.transition = 'transform 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+              slideEl.style.transform = 'translateX(0)';
+            });
+          });
         } else {
           toast('已经是最后一张');
           slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
           slideEl.style.transform = 'translateX(0)';
         }
       }
+
+      // 重新绑定翻转事件
+      const newFc = document.getElementById('flashcard');
+      if (newFc) {
+        newFc.onclick = (e) => { if (e.target.id !== 'flagBtn') newFc.classList.toggle('flipped'); };
+      }
+      const newFlag = document.getElementById('flagBtn');
+      if (newFlag) newFlag.onclick = async (e) => {
+        e.stopPropagation();
+        const c = studyState.queue[studyState.index];
+        c.flagged = !c.flagged;
+        await put('cards', c);
+        newFlag.textContent = c.flagged ? '⭐' : '☆';
+        toast(c.flagged ? '已标记' : '已取消标记');
+      };
     }, 430);
   });
-}
 
-function goNextCard() { /* 保留接口，由滑动直接操作 studyState.index */ }
-function goPrevCard() { /* 保留接口 */ }
+  track.addEventListener('touchcancel', () => {
+    document.body.style.overflow = '';
+    document.body.style.touchAction = '';
+    slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
+    slideEl.style.transform = 'translateX(0)';
+  });
+}
 
 async function judgeCard(remembered) {
   const card = studyState.queue[studyState.index];
@@ -530,7 +590,9 @@ async function judgeCard(remembered) {
   else { card.wrongCount += 1; card.correctStreak = 0; studyState.wrong++; studyState.sessionWrong.push(card.id); }
   await put('cards', card);
   studyState.index++;
-  renderStudyPage();
+  if (studyState.index >= studyState.queue.length) { renderStudyDone(); return; }
+  updateCardContent(studyState.queue[studyState.index]);
+  updateProgressUI();
 }
 
 async function renderStudyDone() {
