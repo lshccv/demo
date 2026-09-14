@@ -2,11 +2,12 @@
  *  闪卡学习 - 本地卡片记忆学习工具
  *  存储: IndexedDB  交互: SPA + 底部 Tab  答案: 翻转自判
  *  修复：滑动方向/动画速度/页面抖动/只切卡片不重绘
+ *  新增：①导入顺序锁定(预览/首页/刷题三端一致) ②目录与卡片编辑/删除
  * ============================================================ */
 
 /* ---------- 1. IndexedDB ---------- */
 const DB_NAME = 'FlashCardDB';
-const DB_VERSION = 2;
+const DB_VERSION = 3; // ★ 升级版本，用于迁移新增字段
 let db = null;
 
 function openDB() {
@@ -47,7 +48,7 @@ const defaultSettings = {
   cardsPerSession: 20,
   sortMode: 'due_first',
   darkMode: 'auto',
-  version: 2
+  version: 3
 };
 async function getSetting(key) {
   const s = await get('settings', key);
@@ -144,16 +145,42 @@ async function importText(text) {
 async function importTreeBatch(treeNodes, onProgress) {
   const chapters = [], cards = [];
   let nodeCount = 0, cardCount = 0;
-  const walk = (nodes, parentId, orderOffset = 0) => {
-    nodes.forEach((node, i) => {
-      const id = uid('nd');
-      chapters.push({ id, name: node.name, level: node.level, parentId, order: orderOffset + i, createdAt: Date.now() });
+
+  // ★★★ 核心修复①：在递归前做两趟预处理，给每个节点和卡片打上【全局导入顺序】
+  // 这样无论后续怎么递归遍历，顺序都锁定为解析时的原始顺序
+  let _nodeSeq = 0, _cardSeq = 0;
+  const preAssignOrder = (nodes) => {
+    nodes.forEach((node) => {
+      node._importOrder = _nodeSeq++;       // 节点全局顺序
+      (node.cards || []).forEach((c) => { c._importOrder = _cardSeq++; }); // 卡片全局顺序
+      if (node.children && node.children.length) preAssignOrder(node.children);
+    });
+  };
+  preAssignOrder(treeNodes);
+
+  const walk = (nodes, parentId) => {
+    // ★ 按预处理顺序排序，保证同层级稳定（不再用 forEach 的 i 作为 order）
+    const sorted = nodes.slice().sort((a, b) => (a._importOrder ?? 0) - (b._importOrder ?? 0));
+    sorted.forEach((node) => {
+      const id = (node.id && /^nd_/.test(node.id)) ? node.id : uid('nd');
+      chapters.push({
+        id, name: node.name, level: node.level, parentId,
+        order: node._importOrder,   // ★ 用全局顺序，跨层级不冲突
+        createdAt: Date.now()
+      });
       nodeCount++;
       for (const c of (node.cards || [])) {
-        cards.push({ id: uid('cd'), chapterId: id, question: c.question, answers: c.answers, hint: c.hint || '', correctStreak: 0, wrongCount: 0, lastReviewed: 0, easeFactor: 2.5, flagged: false, tags: [], difficulty: 0 });
+        cards.push({
+          id: (c.id && /^cd_/.test(c.id)) ? c.id : uid('cd'),
+          chapterId: id, question: c.question, answers: c.answers,
+          hint: c.hint || '', correctStreak: 0, wrongCount: 0,
+          lastReviewed: 0, easeFactor: 2.5, flagged: false, tags: [],
+          difficulty: 0,
+          importOrder: c._importOrder   // ★ 新增：锁定卡片在导入时的全局顺序
+        });
         cardCount++;
       }
-      walk(node.children || [], id, 0);
+      if (node.children && node.children.length) walk(node.children, id);
     });
   };
   walk(treeNodes, null);
@@ -177,7 +204,7 @@ async function importTreeBatch(treeNodes, onProgress) {
 /* ---------- 6. 导出/导入备份 ---------- */
 async function exportJSON() {
   const [chapters, cards, settings] = await Promise.all([getAll('chapters'), getAll('cards'), getAll('settings')]);
-  const data = { version: 2, chapters, cards, settings, exportedAt: Date.now() };
+  const data = { version: 3, chapters, cards, settings, exportedAt: Date.now() };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -217,17 +244,27 @@ async function getDueCards(scopeNodeId) {
   if (scopeNodeId) chapterIds = await getDescendantIds(scopeNodeId);
   let cards = scopeNodeId ? allCards.filter(c => chapterIds.includes(c.chapterId)) : allCards;
   const mode = await getSetting('sortMode');
+
+  // ★★★ 核心修复②：任何模式下都【先】按 importOrder 做稳定排序，保证与预览顺序一致
+  cards.sort((a, b) => {
+    if (a.importOrder != null && b.importOrder != null) return a.importOrder - b.importOrder;
+    if (a.importOrder != null) return -1;
+    if (b.importOrder != null) return 1;
+    return 0;
+  });
+
   if (mode === 'wrong_first') {
     cards.sort((a, b) => (b.wrongCount - a.wrongCount) || (a.correctStreak - b.correctStreak) || (a.lastReviewed - b.lastReviewed));
   } else if (mode === 'random') {
     cards.sort(() => Math.random() - 0.5);
   } else {
+    // due_first：错题/未学优先，但同组内保持 importOrder 顺序
     cards.sort((a, b) => {
       const aw = a.wrongCount > 0 ? 0 : 1; const bw = b.wrongCount > 0 ? 0 : 1;
       if (aw !== bw) return aw - bw;
       const an = a.lastReviewed === 0 ? 0 : 1; const bn = b.lastReviewed === 0 ? 0 : 1;
       if (an !== bn) return an - bn;
-      return a.lastReviewed - b.lastReviewed;
+      return (a.importOrder ?? 0) - (b.importOrder ?? 0); // ★ 用 importOrder 兜底
     });
   }
   const limit = await getSetting('cardsPerSession');
@@ -322,16 +359,57 @@ async function renderHome(page) {
       <div class="chapter-right">
         ${directCards.length > 0 && hasChildren ? `<button class="mini-study-btn" data-study="1">▶ ${directCards.length}</button>` : ''}
         <span class="chapter-arrow">${hasChildren ? '›' : '▶'}</span>
+      </div>
+      <!-- ★★★ 新增：目录编辑/删除按钮（点击出现，再点隐藏） -->
+      <div class="chapter-actions">
+        <button class="chapter-act-btn" data-act="edit" title="重命名">✎</button>
+        <button class="chapter-act-btn chapter-act-del" data-act="delete" title="删除">🗑</button>
       </div>`;
     div.addEventListener('dragstart', e => { e.dataTransfer.setData('text/plain', node.id); div.classList.add('dragging'); });
     div.addEventListener('dragover', e => e.preventDefault());
     div.addEventListener('drop', async e => { e.preventDefault(); const fromId = e.dataTransfer.getData('text/plain'); if (fromId === node.id) return; await reorderChapters(currentParentId, fromId, node.id); render(); });
     div.addEventListener('dragend', () => div.classList.remove('dragging'));
+
+    // ★ 新增：编辑/删除按钮事件
+    div.querySelector('[data-act="edit"]').onclick = (e) => { e.stopPropagation(); editChapter(node); };
+    div.querySelector('[data-act="delete"]').onclick = async (e) => {
+      e.stopPropagation();
+      const count = countSubCards(node.id, allChapters, allCards);
+      if (confirm(`确定删除「${node.name}」及其下全部卡片（共 ${count} 题）？此操作不可撤销。`)) {
+        await deleteChapterRecursive(node.id);
+        toast('已删除');
+        render();
+      }
+    };
+
     const studyBtn = div.querySelector('[data-study]');
     if (studyBtn) studyBtn.addEventListener('click', (e) => { e.stopPropagation(); startStudyWithCards(directCards, node.name); });
     div.onclick = () => { if (hasChildren) { navStack.push({ id: node.id, name: node.name, level: node.level }); render(); } else if (directCards.length > 0) { startStudy(node.id); } else toast('该节点下暂无卡片'); };
     page.appendChild(div);
   }
+}
+
+// ★★★ 新增：重命名目录
+async function editChapter(node) {
+  const name = prompt('修改目录名称：', node.name);
+  if (name == null) return;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed === node.name) return;
+  node.name = trimmed;
+  await put('chapters', node);
+  toast('已重命名');
+  render();
+}
+
+// ★★★ 新增：递归删除目录及其下所有卡片
+async function deleteChapterRecursive(nodeId) {
+  const all = await getAll('chapters');
+  const children = all.filter(c => c.parentId === nodeId);
+  for (const child of children) await deleteChapterRecursive(child.id); // 先删子目录
+  const allCards = await getAll('cards');
+  const toDelete = allCards.filter(c => c.chapterId === nodeId);
+  for (const c of toDelete) await del('cards', c.id);                  // 删该目录下卡片
+  await del('chapters', nodeId);                                       // 最后删目录本身
 }
 
 async function reorderChapters(parentId, fromId, toId) {
@@ -379,7 +457,7 @@ async function renderStudy(page) {
 
   const { queue, index, correct, wrong, path } = studyState;
   const card = queue[index];
- const progressPct = queue.length ? Math.round((index + 1) / queue.length * 100) : 0;
+  const progressPct = queue.length ? Math.round((index + 1) / queue.length * 100) : 0;
   const pathStr = (path && path.length) ? path.join(' › ') : '';
   headerTitle.textContent = pathStr.length > 12 ? '…' + pathStr.slice(-12) : (pathStr || '刷题');
 
@@ -427,6 +505,9 @@ function renderCardInner(card, pathStr) {
           ${card.hint ? `<div class="flashcard-hint">提示：${escapeHtml(card.hint)}</div>` : ''}
           <div class="flashcard-chapter">${escapeHtml(pathStr)}</div>
           <button class="flag-btn ${card.flagged ? 'flagged' : ''}" id="flagBtn" style="position:absolute;top:12px;right:12px">${card.flagged ? '⭐' : '☆'}</button>
+          <!-- ★★★ 新增：卡片编辑/删除按钮 -->
+          <button class="card-act-btn" id="editCardBtn" title="编辑卡片">✎</button>
+          <button class="card-act-btn card-act-del" id="deleteCardBtn" title="删除卡片">🗑</button>
         </div>
       </div>
     </div>
@@ -448,7 +529,7 @@ function bindStudyEvents() {
   // 翻转
   const fc = document.getElementById('flashcard');
   if (fc) {
-    fc.onclick = (e) => { if (e.target.id !== 'flagBtn') fc.classList.toggle('flipped'); };
+    fc.onclick = (e) => { if (e.target.id !== 'flagBtn' && !e.target.classList.contains('card-act-btn')) fc.classList.toggle('flipped'); };
   }
 
   // 判分
@@ -464,6 +545,35 @@ function bindStudyEvents() {
     await put('cards', card);
     flagBtn.textContent = card.flagged ? '⭐' : '☆';
     toast(card.flagged ? '已标记' : '已取消标记');
+  };
+
+  // ★ 新增：编辑卡片
+  const editCardBtn = document.getElementById('editCardBtn');
+  if (editCardBtn) editCardBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const card = studyState.queue[studyState.index];
+    await openCardEditor(card, async (updated) => {
+      Object.assign(card, updated);
+      await put('cards', card);
+      toast('卡片已更新');
+      updateCardContent(card); // 刷新当前卡片显示
+    });
+  };
+
+  // ★ 新增：删除卡片
+  const deleteCardBtn = document.getElementById('deleteCardBtn');
+  if (deleteCardBtn) deleteCardBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const card = studyState.queue[studyState.index];
+    if (!confirm('删除这张卡片？此操作不可撤销。')) return;
+    await del('cards', card.id);
+    toast('已删除');
+    // 从队列中移除当前卡，并切到下一张
+    studyState.queue.splice(studyState.index, 1);
+    if (!studyState.queue.length) { renderStudyDone(); return; }
+    if (studyState.index >= studyState.queue.length) studyState.index = studyState.queue.length - 1;
+    updateCardContent(studyState.queue[studyState.index]);
+    updateProgressUI();
   };
 
   // ===== 滑动手势 =====
@@ -565,7 +675,7 @@ function bindStudyEvents() {
       // 重新绑定翻转事件
       const newFc = document.getElementById('flashcard');
       if (newFc) {
-        newFc.onclick = (e) => { if (e.target.id !== 'flagBtn') newFc.classList.toggle('flipped'); };
+        newFc.onclick = (e) => { if (e.target.id !== 'flagBtn' && !e.target.classList.contains('card-act-btn')) newFc.classList.toggle('flipped'); };
       }
       const newFlag = document.getElementById('flagBtn');
       if (newFlag) newFlag.onclick = async (e) => {
@@ -576,6 +686,8 @@ function bindStudyEvents() {
         newFlag.textContent = c.flagged ? '⭐' : '☆';
         toast(c.flagged ? '已标记' : '已取消标记');
       };
+      // ★ 重新绑定编辑/删除按钮（卡片已切换）
+      bindCardActButtons();
     }, 430);
   });
 
@@ -585,6 +697,34 @@ function bindStudyEvents() {
     slideEl.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
     slideEl.style.transform = 'translateX(0)';
   });
+}
+
+// ★★★ 新增：绑定当前卡片的编辑/删除按钮（切换卡片后调用）
+function bindCardActButtons() {
+  const editCardBtn = document.getElementById('editCardBtn');
+  if (editCardBtn) editCardBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const card = studyState.queue[studyState.index];
+    await openCardEditor(card, async (updated) => {
+      Object.assign(card, updated);
+      await put('cards', card);
+      toast('卡片已更新');
+      updateCardContent(card);
+    });
+  };
+  const deleteCardBtn = document.getElementById('deleteCardBtn');
+  if (deleteCardBtn) deleteCardBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const card = studyState.queue[studyState.index];
+    if (!confirm('删除这张卡片？此操作不可撤销。')) return;
+    await del('cards', card.id);
+    toast('已删除');
+    studyState.queue.splice(studyState.index, 1);
+    if (!studyState.queue.length) { renderStudyDone(); return; }
+    if (studyState.index >= studyState.queue.length) studyState.index = studyState.queue.length - 1;
+    updateCardContent(studyState.queue[studyState.index]);
+    updateProgressUI();
+  };
 }
 
 async function judgeCard(remembered) {
@@ -708,13 +848,88 @@ async function renderSettings(page) {
   document.getElementById('clearBtn').onclick = async () => { if (confirm('确定清空所有数据？此操作不可恢复！建议先导出备份。')) { await clearStore('cards'); await clearStore('chapters'); await clearStore('settings'); toast('已清空'); navStack.length = 0; render(); } };
 }
 
-/* ---------- 13. 启动 ---------- */
+/* ---------- 13. 卡片编辑弹窗 ---------- */
+// ★★★ 新增：通用的卡片编辑弹窗（新增/修改共用）
+function openCardEditor(card, onSave) {
+  const isNew = !card || !card.id;
+  const q = isNew ? '' : card.question;
+  const a = isNew ? '' : card.answers.join('|');
+  const h = isNew ? '' : (card.hint || '');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'import-preview editor-overlay';
+  overlay.innerHTML = `
+    <div class="preview-header">
+      <button class="preview-back" id="editorCancel">‹ 取消</button>
+      <h2 class="preview-title">${isNew ? '新增卡片' : '编辑卡片'}</h2>
+      <button class="preview-confirm" id="editorSave">保存</button>
+    </div>
+    <div class="preview-body">
+      <div class="card">
+        <label style="font-size:13px;color:var(--text-sub)">题干（用 ___ 表示填空）</label>
+        <textarea id="editorQuestion" class="import-area" style="width:100%;min-height:80px;margin-top:6px">${escapeHtml(q)}</textarea>
+      </div>
+      <div class="card">
+        <label style="font-size:13px;color:var(--text-sub)">答案（多个用 | 分隔）</label>
+        <input id="editorAnswer" class="import-area" style="width:100%;min-height:40px;margin-top:6px" value="${escapeHtml(a)}">
+      </div>
+      <div class="card">
+        <label style="font-size:13px;color:var(--text-sub)">提示（可选）</label>
+        <input id="editorHint" class="import-area" style="width:100%;min-height:36px;margin-top:6px" value="${escapeHtml(h)}">
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => overlay.classList.add('show'));
+
+  const close = () => { overlay.classList.remove('show'); setTimeout(() => overlay.remove(), 250); };
+
+  overlay.querySelector('#editorCancel').onclick = close;
+  overlay.querySelector('#editorSave').onclick = async () => {
+    const question = overlay.querySelector('#editorQuestion').value.trim();
+    const answerRaw = overlay.querySelector('#editorAnswer').value.trim();
+    const hint = overlay.querySelector('#editorHint').value.trim();
+    if (!question) { toast('题干不能为空'); return; }
+    if (!answerRaw) { toast('请至少填写一个答案'); return; }
+    const answers = answerRaw.split('|').map(s => s.trim()).filter(Boolean);
+    if (!answers.length) { toast('请至少填写一个答案'); return; }
+
+    const updated = isNew
+      ? { question, answers, hint, correctStreak: 0, wrongCount: 0, lastReviewed: 0, easeFactor: 2.5, flagged: false, tags: [], difficulty: 0 }
+      : { ...card, question, answers, hint };
+
+    await onSave(updated);
+    close();
+  };
+}
+
+/* ---------- 14. 启动 ---------- */
 document.querySelectorAll('.tab').forEach(tab => { tab.onclick = () => { currentTab = tab.dataset.tab; if (currentTab !== 'study') studyState = null; render(); }; });
 document.getElementById('header-back').onclick = () => { if (currentTab === 'study') { currentTab = 'home'; studyState = null; render(); } else if (currentTab === 'home' && navStack.length > 0) { navStack.pop(); render(); } };
 
 (async function init() {
   await openDB();
+  // ★ 数据库升级后，给旧卡片补上 importOrder 字段（按 id 稳定排序，避免顺序错乱）
+  await migrateImportOrder();
   for (const k of Object.keys(defaultSettings)) { const existing = await get('settings', k); if (existing === undefined) await put('settings', { key: k, value: defaultSettings[k] }); }
   applyTheme(); render();
   if ('serviceWorker' in navigator) { try { await navigator.serviceWorker.register('sw.js'); } catch (e) { console.warn('SW 注册失败', e); } }
 })();
+
+// ★★★ 新增：旧数据迁移 —— 为缺失 importOrder 的卡片按 chapterId+createdAt 补上顺序
+async function migrateImportOrder() {
+  const allCards = await getAll('cards');
+  const needFix = allCards.filter(c => c.importOrder == null);
+  if (!needFix.length) return;
+  // 按章节分组，组内按现有顺序（lastReviewed/correctStreak 保持稳定）编号
+  const byChapter = {};
+  needFix.forEach(c => { (byChapter[c.chapterId] = byChapter[c.chapterId] || []).push(c); });
+  let global = 0;
+  for (const chId of Object.keys(byChapter)) {
+    byChapter[chId]
+      .sort((a, b) => (a.lastReviewed - b.lastReviewed) || (a.id || '').localeCompare(b.id || ''))
+      .forEach(c => { c.importOrder = global++; });
+    // 批量写入放在循环外？这里逐条写更简单
+  }
+  for (const c of needFix) { if (c.importOrder == null) c.importOrder = global++; await put('cards', c); }
+}
