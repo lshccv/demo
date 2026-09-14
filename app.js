@@ -375,7 +375,7 @@ async function renderStudy(page) {
 
   const { queue, index, correct, wrong, path } = studyState;
   const card = queue[index];
-  const progressPct = queue.length ? Math.round(index / queue.length * 100) : 0;
+  const progressPct = queue.length ? Math.round((index + 1) / queue.length * 100) : 0;
   const pathStr = (path && path.length) ? path.join(' › ') : '';
   headerTitle.textContent = pathStr.length > 12 ? '…' + pathStr.slice(-12) : (pathStr || '刷题');
 
@@ -433,7 +433,7 @@ function updateProgressUI() {
   const { queue, index, correct, wrong } = studyState;
   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
-  if (fill) fill.style.width = queue.length ? Math.round(index / queue.length * 100) + '%' : '0%';
+  if (fill) fill.style.width = queue.length ? Math.round((index + 1) / queue.length * 100) + '%' : '0%';
   if (text) text.textContent = `${index + 1} / ${queue.length}　✅ ${correct}　❌ ${wrong}`;
 }
 
