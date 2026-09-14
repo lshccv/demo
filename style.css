@@ -113,7 +113,7 @@ body {
 .study-progress-text { font-size: 13px; color: var(--text-sub); text-align: center; }
 .flashcard {
   flex: 1; perspective: 1000px; cursor: pointer; margin-bottom: 16px;
-  min-height: 380px;
+  min-height: 480px;
 }
 .flashcard-inner {
   position: relative; width: 100%; height: 100%;
@@ -272,7 +272,7 @@ body {
   flex: 1;
   position: relative;
   overflow: hidden;
-  min-height: 380px;
+  min-height: 480px;
   touch-action: none;          /* ★ 关键：彻底禁止浏览器接管触摸 */
 }
 .flashcard-slide {
