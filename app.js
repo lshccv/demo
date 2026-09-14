@@ -64,7 +64,11 @@ function toast(msg) {
   clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove('show'), 2000);
 }
 function escapeHtml(str) { return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s])); }
-function renderQuestion(text) { return escapeHtml(text).replace(/___/g, '<span class="blank">_____</span>'); }
+function renderQuestion(text) {
+  return escapeHtml(text)
+    .replace(/___/g, '<span class="blank">_____</span>')
+    .replace(/\n/g, '<br>');
+}
 function applyTheme() {
   const theme = localStorage.getItem('theme') || 'auto';
   const dark = theme === 'dark' || (theme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
