@@ -297,3 +297,39 @@ body {
   position: relative;
   touch-action: none;
 }
+
+/* ===== 目录项编辑/删除按钮 ===== */
+.chapter-item { position: relative; }
+.chapter-actions {
+  position: absolute; top: 8px; right: 8px;
+  display: none; gap: 4px; z-index: 5;
+}
+.chapter-item:hover .chapter-actions,
+.chapter-actions:hover { display: flex; }
+.chapter-act-btn {
+  width: 28px; height: 28px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--card-bg); color: var(--text-sub); font-size: 14px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; line-height: 1;
+}
+.chapter-act-btn:hover { border-color: var(--primary); color: var(--primary); }
+.chapter-act-del:hover { border-color: var(--danger); color: #fff; background: var(--danger); }
+
+/* ===== 刷题页卡片编辑/删除按钮 ===== */
+.card-act-btn {
+  position: absolute; bottom: 12px; right: 12px;
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; font-size: 13px; cursor: pointer; z-index: 6; line-height: 1;
+}
+.card-act-btn:hover { border-color: var(--primary); }
+.card-act-del { right: 52px; }
+.card-act-del:hover { border-color: var(--danger); color: var(--danger); }
+
+/* ===== 卡片编辑弹窗（复用导入预览样式） ===== */
+.editor-overlay .preview-body { gap: 10px; }
+.editor-overlay .import-area {
+  min-height: 40px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.6;
+  outline: none; width: 100%; box-sizing: border-box;
+}
+.editor-overlay .import-area:focus { border-color: var(--primary); }
+.editor-overlay textarea.import-area { resize: vertical; }
